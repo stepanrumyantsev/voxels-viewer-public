@@ -19,11 +19,25 @@ forward/backward-compatibility checks.
 - Four viewports: **XY**, **YZ**, **XZ** slices and an interactive **3D** view.
 - Two 2×2 layouts via **View → Layout**: **Classic** and **Engineering**
   (Engineering = XY / 3D on top, XZ / YZ on the bottom). The choice is remembered.
-- Maximize/restore any single viewport.
-- Per-axis slice sliders for the 2D views.
+- Maximize/restore any single viewport. When a 2D viewport is maximized, a small
+  **3D picture-in-picture** preview appears in the corner — its camera is locked
+  to that viewport's orientation and it shows the matching coordinate plane,
+  which tracks the slice slider. The preview sizes itself so the volume's
+  bounding box fills it.
+- Per-axis slice slider for each 2D view, with a synced numeric spinbox showing
+  the slice position in **millimetres** (range/step derived from the voxel size).
 - A lock button to sync zoom/pan and crosshair coordinate lines across the 2D
-  viewports; coordinate lines also appear briefly when you zoom/scroll. Lock
-  state is remembered between sessions.
+  viewports; lock state is remembered between sessions.
+- **Coordinate lines** toggle (per 2D viewport, linked across all three). When
+  unlocked, the line for the slider you move appears and auto-hides after a few
+  seconds; when locked, all coordinate lines stay pinned.
+- **Clipping plane** toggle — a 3-state button (**Off / Clip Left / Clip Right**)
+  on each 2D viewport that hides one half of the **3D** volume along that
+  viewport's axis. Clipping is display-only (it never alters the data); a
+  "Clipping is on" hint shows in the 3D view while any clip is active.
+- **View → Voxels Interpolation** (**Off** / **On**) — smooth (interpolated)
+  voxel display in the 2D viewports instead of blocky nearest-neighbour, with no
+  measurable performance cost. Remembered between sessions (default Off).
 - Orientation tripod overlay in each viewport.
 
 ### Histogram & windowing
@@ -51,6 +65,15 @@ forward/backward-compatibility checks.
 ### 3D view
 - **Isosurface** (marching cubes, with an isovalue slider) and **Phong Volume**
   rendering; the Phong render respects the histogram window.
+- **Coordinate planes** — colour-coded slice planes (**red** = YZ, **green** = XZ,
+  **blue** = XY), semi-transparent with white outlines that stay visible through
+  the volume. Toggle them with the button next to the isovalue slider. Each plane
+  follows its 2D viewport's slice position and resizes/shifts with that
+  viewport's zoom, pan, and field of view. Overlapping planes keep their pure
+  colours (no blending), and the volume/surface always reads in front.
+- **Clipping** — the Clip Left / Clip Right buttons on the 2D viewports cut away
+  the corresponding half of the rendered volume or isosurface, live and
+  independently per axis (display-only).
 - Free turntable rotation (no pole flipping / inversion).
 - Right-click → **Quality**: **Low** / **Default** / **High** render resolution.
 
@@ -67,7 +90,9 @@ forward/backward-compatibility checks.
   progress bar.
 - **File → Open / Save Voxels Project…** — saves the source reference, window,
   viewport state, alignment, lock state, render mode, and camera to a `.voxels`
-  file.
+  file. The title bar shows the current project name (or **New Project** until it
+  is saved), and closing the app prompts to **save unsaved changes**
+  (**Yes / No / Cancel**) when there are any.
 - **Operations → Volume Information…** — a read-only histogram plus a table of
   voxel dimensions, physical dimensions, voxel size, data type, and volume size.
 

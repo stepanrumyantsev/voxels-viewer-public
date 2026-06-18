@@ -81,6 +81,66 @@ except ModuleNotFoundError as exc:
     raise
 
 try:
+    from OpenGL import GL as _GL
+    # Always-on-top lines (frames): no depth test. Also restores depth/colour
+    # state to defaults — frames are drawn last, so this cleans up after the
+    # coordinate-plane depth pre-pass below.
+    _ONTOP_GLOPTS = {
+        _GL.GL_DEPTH_TEST: False,
+        _GL.GL_BLEND: True,
+        _GL.GL_CULL_FACE: False,
+        'glDepthMask': (_GL.GL_TRUE,),
+        'glDepthFunc': (_GL.GL_LESS,),
+        'glColorMask': (_GL.GL_TRUE, _GL.GL_TRUE, _GL.GL_TRUE, _GL.GL_TRUE),
+        'glBlendFunc': (_GL.GL_SRC_ALPHA, _GL.GL_ONE_MINUS_SRC_ALPHA),
+    }
+    # Coordinate-plane depth pre-pass: write only the NEAREST plane's depth per
+    # pixel (no colour).
+    _PLANE_DEPTH_GLOPTS = {
+        _GL.GL_DEPTH_TEST: True,
+        _GL.GL_BLEND: False,
+        _GL.GL_CULL_FACE: False,
+        'glDepthFunc': (_GL.GL_LESS,),
+        'glDepthMask': (_GL.GL_TRUE,),
+        'glColorMask': (_GL.GL_FALSE, _GL.GL_FALSE, _GL.GL_FALSE, _GL.GL_FALSE),
+    }
+    # Colour pass: only fragments matching the pre-pass depth draw, so exactly
+    # one (the nearest) plane colours each pixel — never a blend of two planes.
+    _PLANE_COLOR_GLOPTS = {
+        _GL.GL_DEPTH_TEST: True,
+        _GL.GL_BLEND: True,
+        _GL.GL_CULL_FACE: False,
+        'glDepthFunc': (_GL.GL_LEQUAL,),
+        'glDepthMask': (_GL.GL_FALSE,),
+        'glColorMask': (_GL.GL_TRUE, _GL.GL_TRUE, _GL.GL_TRUE, _GL.GL_TRUE),
+        'glBlendFunc': (_GL.GL_SRC_ALPHA, _GL.GL_ONE_MINUS_SRC_ALPHA),
+    }
+except Exception:
+    _GL = None
+    _ONTOP_GLOPTS = 'additive'
+    _PLANE_DEPTH_GLOPTS = 'opaque'
+    _PLANE_COLOR_GLOPTS = 'translucent'
+
+
+class _GLDepthClear(gl.GLGraphicsItem.GLGraphicsItem):
+    """Invisible item that clears the GL depth buffer (and resets depth/colour
+    state) when painted, so items drawn after it depth-test against a fresh
+    buffer. Lets the coordinate planes be layered independently of the
+    volume/surface depth."""
+
+    def paint(self):
+        self.setupGLState()
+        if _GL is None:
+            return
+        try:
+            _GL.glDepthMask(_GL.GL_TRUE)
+            _GL.glDepthFunc(_GL.GL_LESS)
+            _GL.glColorMask(_GL.GL_TRUE, _GL.GL_TRUE, _GL.GL_TRUE, _GL.GL_TRUE)
+            _GL.glClear(_GL.GL_DEPTH_BUFFER_BIT)
+        except Exception:
+            pass
+
+try:
     import imageio.v2 as imageio
 except ImportError:
     import imageio
@@ -107,7 +167,7 @@ APP_NAME = 'Voxels Viewer'
 # and forms the full version (YY.M.build) used in the About dialog and saved
 # into .voxels project files for compatibility checks.
 APP_VERSION = '26.6'          # June 2026
-APP_BUILD = 12
+APP_BUILD = 38
 APP_VERSION_FULL = f'{APP_VERSION}.{APP_BUILD}'
 
 
@@ -247,6 +307,9 @@ _PREFS_DEFAULTS: dict = {
     'viewport_layout': 'Engineering',
     'sync_locked': True,
     'measurement_tool': 'distance',
+    'coord_lines_visible': True,
+    'coord_planes_visible': False,
+    'voxel_interpolation': False,
 }
 
 
@@ -1451,6 +1514,63 @@ def _grayvalue_icon(kind: str) -> QtGui.QIcon:
     return icon
 
 
+def _clip_icon(state: str) -> QtGui.QIcon:
+    """Scissors icon for the clipping-plane toggle.
+
+    'off' → full scissors; 'left' → only the right half is drawn (left half of
+    the scissors removed); 'right' → only the left half is drawn. The removed
+    half mirrors the part of the volume being clipped away.
+    """
+    icon = QtGui.QIcon()
+    for dpr in (1.0, 2.0):
+        S = round(20 * dpr)
+        px = QtGui.QPixmap(S, S)
+        px.setDevicePixelRatio(dpr)
+        px.fill(Qt.transparent)
+        p = QtGui.QPainter(px)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        p.scale(S / 20.0, S / 20.0)
+        pen = QtGui.QPen(QtGui.QColor('#cccccc'), 1.6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+
+        def scissors():
+            p.setPen(pen)
+            p.setBrush(Qt.NoBrush)
+            p.drawEllipse(QtCore.QRectF(4.0, 14.0, 5.0, 5.0))    # left handle ring
+            p.drawEllipse(QtCore.QRectF(11.0, 14.0, 5.0, 5.0))   # right handle ring
+            p.drawLine(QtCore.QLineF(6.5, 16.5, 15.5, 4.0))      # blade
+            p.drawLine(QtCore.QLineF(13.5, 16.5, 4.5, 4.0))      # blade
+
+        if state == 'left':       # remove the left half → draw only the right half
+            p.setClipRect(QtCore.QRectF(10, 0, 10, 20))
+        elif state == 'right':    # remove the right half → draw only the left half
+            p.setClipRect(QtCore.QRectF(0, 0, 10, 20))
+        scissors()
+        p.end()
+        icon.addPixmap(px)
+    return icon
+
+
+def _coord_axes_icon() -> QtGui.QIcon:
+    """Coordinate-system icon: a horizontal + vertical pair plus a diagonal,
+    all through the same point (toggles the 3D coordinate planes)."""
+    icon = QtGui.QIcon()
+    for dpr in (1.0, 2.0):
+        S = round(20 * dpr)
+        px = QtGui.QPixmap(S, S)
+        px.setDevicePixelRatio(dpr)
+        px.fill(Qt.transparent)
+        p = QtGui.QPainter(px)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        p.scale(S / 20.0, S / 20.0)
+        p.setPen(QtGui.QPen(QtGui.QColor('#cccccc'), 1.6, Qt.SolidLine, Qt.RoundCap))
+        p.drawLine(QtCore.QLineF(2.0, 10.0, 18.0, 10.0))     # horizontal axis
+        p.drawLine(QtCore.QLineF(10.0, 2.0, 10.0, 18.0))     # vertical axis
+        p.drawLine(QtCore.QLineF(4.7, 15.3, 15.3, 4.7))      # diagonal axis
+        p.end()
+        icon.addPixmap(px)
+    return icon
+
+
 class _GrayValuePicker:
     """Draggable yellow crosshair showing the X/Y/Z coords and gray value."""
 
@@ -1635,6 +1755,13 @@ class SliceViewer(QWidget):
     axis_position_changed = Signal(str, int, int)  # (axis, index, total)
     lock_clicked = Signal()
     measurement_tool_changed = Signal(str)         # user picked a tool from the menu
+    clip_changed = Signal()                        # clipping-plane toggle changed
+    planes_toggled = Signal(bool)                  # coordinate-planes visibility toggle
+
+    _CLIP_STATES = ('off', 'left', 'right')
+    _CLIP_TOOLTIP = {'off': 'Clipping plane: off',
+                     'left': 'Clipping plane: hide below this slice in 3D',
+                     'right': 'Clipping plane: hide above this slice in 3D'}
 
     _MEAS_LABELS = {'distance': 'Distance', 'angle': 'Angle', 'diameter': 'Diameter'}
     _GRAY_LABELS = {'picker': 'Gray Value Picker', 'profile': 'Gray Value Profile'}
@@ -1652,6 +1779,7 @@ class SliceViewer(QWidget):
         self._measure_tool = 'distance'
         self._gray_items = []
         self._gray_tool = 'picker'
+        self._clip_state = 'off'
         self._display_levels = None
         self._auto_range_pending = True
         self._preview_R      = None   # 3×3 rotation for live Simple Alignment preview
@@ -1663,6 +1791,9 @@ class SliceViewer(QWidget):
         self._axis_lines  = {}   # axis -> pg.InfiniteLine
         self._axis_timers = {}   # axis -> QTimer
         self._lines_pinned = False
+        self._coord_lines_enabled = True
+        self._pip = None   # picture-in-picture 3D preview, shown when maximized
+        self._interpolate = False   # smooth (trilinear) vs nearest-neighbour voxels
         self.init_ui()
 
     def init_ui(self):
@@ -1718,6 +1849,24 @@ class SliceViewer(QWidget):
         self.set_gray_tool(self._gray_tool)
         header.addWidget(self.gray_button)
 
+        self._clip_icons = {s: _clip_icon(s) for s in self._CLIP_STATES}
+        self.clip_button = QPushButton()
+        self.clip_button.setFixedSize(24, 24)
+        self.clip_button.setIconSize(QtCore.QSize(16, 16))
+        self.clip_button.clicked.connect(self._cycle_clip)
+        self._update_clip_button()
+        header.addWidget(self.clip_button)
+
+        self.planes_button = QPushButton()
+        self.planes_button.setCheckable(True)
+        self.planes_button.setChecked(True)
+        self.planes_button.setFixedSize(24, 24)
+        self.planes_button.setIconSize(QtCore.QSize(16, 16))
+        self.planes_button.setIcon(_coord_axes_icon())
+        self.planes_button.setToolTip('Show coordinate lines in the 2D viewports')
+        self.planes_button.toggled.connect(self.planes_toggled)
+        header.addWidget(self.planes_button)
+
         header.addStretch()
         self.maximize_button = QPushButton('▲')
         self.maximize_button.setFixedSize(24, 24)
@@ -1772,11 +1921,24 @@ class SliceViewer(QWidget):
                 border-radius: 7px;
             }}
         """)
+        # Distance-unit readout of the slice position, fully synced with the
+        # slider (XY → Z, YZ → X, XZ → Y, in mm). Range mirrors the slider's
+        # range mapped to mm; step is 1/100th of that range.
+        self.slice_spin = QtWidgets.QDoubleSpinBox()
+        self.slice_spin.setDecimals(3)
+        self.slice_spin.setRange(0.0, 0.0)
+        self.slice_spin.setSuffix(' mm')
+        self.slice_spin.setFixedWidth(96)
+        self.slice_spin.setKeyboardTracking(False)
+        self.slice_spin.setToolTip('Slice position in distance units')
+        self.slice_spin.valueChanged.connect(self.on_slice_spin_changed)
+
         bottom_bar = QWidget()
         bottom_bar.setFixedHeight(28)
         bottom = QHBoxLayout(bottom_bar)
         bottom.setContentsMargins(2, 2, 2, 2)
         bottom.addWidget(self.slice_slider)
+        bottom.addWidget(self.slice_spin)
         layout.addWidget(bottom_bar)
 
     def eventFilter(self, obj, event):
@@ -1784,6 +1946,7 @@ class SliceViewer(QWidget):
         if obj is self.image_view and event.type() == _EV_RESIZE:
             self._reposition_tripod()
             self._reposition_auto_hint()
+            self._reposition_pip()
             self.selection_overlay.resize(gv.viewport().size())
         elif obj is gv.viewport():
             et = event.type()
@@ -1808,6 +1971,33 @@ class SliceViewer(QWidget):
         self.tripod.move(m, self.image_view.height() - self.tripod.height() - m)
         self.tripod.raise_()
 
+    # ── Picture-in-picture 3D preview (shown only while maximized) ────────────
+    def attach_pip(self, pip):
+        """Overlay a 3D preview widget in the bottom-right corner."""
+        self._pip = pip
+        pip.setParent(self.image_view)
+        pip.show()
+        self._reposition_pip()
+
+    def detach_pip(self):
+        if self._pip is not None:
+            self._pip.hide()
+            self._pip.setParent(None)
+            self._pip = None
+
+    def _reposition_pip(self):
+        if self._pip is None:
+            return
+        iv = self.image_view
+        # 1/5 of the viewport, 30% larger; lifted off the bottom so it clears the
+        # coordinate scale / tick labels.
+        w = max(80, int(iv.width()  * 0.20 * 1.3))
+        h = max(80, int(iv.height() * 0.20 * 1.3))
+        right_m, bottom_m = 6, 44
+        self._pip.resize(w, h)
+        self._pip.move(iv.width() - w - right_m, iv.height() - h - bottom_m)
+        self._pip.raise_()
+
     def _reposition_auto_hint(self):
         m = 6
         self.auto_hint.adjustSize()
@@ -1823,6 +2013,15 @@ class SliceViewer(QWidget):
                 self.image_view.getImageItem().setLevels((float(min_val), float(max_val)))
             except Exception:
                 pass
+
+    def set_interpolation(self, enabled):
+        """Smoothly interpolate the displayed slice (bilinear in-plane) instead
+        of drawing blocky voxels. It's just a render hint on the graphics view —
+        Qt does the scaling, so there's essentially no performance cost."""
+        self._interpolate = bool(enabled)
+        gv = self.image_view.ui.graphicsView
+        gv.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, self._interpolate)
+        gv.viewport().update()
 
     def set_locked(self, locked):
         self.lock_button.setIcon(_lock_icon(locked))
@@ -1919,6 +2118,41 @@ class SliceViewer(QWidget):
         for g in self._gray_items:
             g.remove()
         self._gray_items = []
+
+    # ── Clipping plane ────────────────────────────────────────────────────
+    def _update_clip_button(self):
+        self.clip_button.setIcon(self._clip_icons[self._clip_state])
+        self.clip_button.setToolTip(self._CLIP_TOOLTIP[self._clip_state])
+
+    def _cycle_clip(self):
+        i = self._CLIP_STATES.index(self._clip_state)
+        self._clip_state = self._CLIP_STATES[(i + 1) % len(self._CLIP_STATES)]
+        self._update_clip_button()
+        self.clip_changed.emit()
+
+    def clip_info(self):
+        """Return (axis_index, mode, fraction) for the active clip, or None.
+
+        fraction is the slice position along this viewer's traversal axis in
+        [0, 1], so the 3D view can map it onto its own (downsampled) volume.
+        """
+        if self._clip_state == 'off':
+            return None
+        shape = self._active_shape()
+        if shape is None:
+            return None
+        ax = self._traversal_axis()
+        depth = shape[ax]
+        frac = self.current_index / max(depth - 1, 1)
+        return ax, self._clip_state, float(frac)
+
+    def slice_fraction(self):
+        """(traversal axis, slice fraction in [0,1]) for the coordinate plane."""
+        shape = self._active_shape()
+        if shape is None:
+            return None
+        ax = self._traversal_axis()
+        return ax, float(self.current_index / max(shape[ax] - 1, 1))
 
     def _displayed_pixel(self, vx, vy):
         """Map a view-coord point to (image_array, px, py) of the displayed slice."""
@@ -2033,11 +2267,36 @@ class SliceViewer(QWidget):
             return self.volume_data.volume.shape
         return None
 
+    def _traversal_spacing(self):
+        """mm-per-slice along this viewport's traversal axis (XY→Z, YZ→X, XZ→Y)."""
+        vs = (1.0, 1.0, 1.0)
+        if self.volume_data is not None and getattr(self.volume_data, 'voxel_size', None):
+            vs = self.volume_data.voxel_size
+        s = float(vs[self._traversal_axis()])
+        return s if s > 0 else 1.0
+
+    def _update_slice_spin_range(self):
+        """Mirror the slider's range onto the distance spinbox (in mm)."""
+        sp = self._traversal_spacing()
+        maximum = max(0, self.slice_slider.maximum()) * sp
+        self.slice_spin.blockSignals(True)
+        self.slice_spin.setRange(0.0, maximum)
+        self.slice_spin.setSingleStep(maximum / 100.0 if maximum > 0 else 1.0)
+        self.slice_spin.blockSignals(False)
+
+    def _sync_slice_spin(self):
+        """Reflect the current slice index on the distance spinbox."""
+        self.slice_spin.blockSignals(True)
+        self.slice_spin.setValue(self.current_index * self._traversal_spacing())
+        self.slice_spin.blockSignals(False)
+
     def _apply_slider_range(self, recenter=True):
         """Set the slider maximum from the active frame's traversal depth."""
         shape = self._active_shape()
         if shape is None:
             self.slice_slider.setMaximum(0)
+            self._update_slice_spin_range()
+            self._sync_slice_spin()
             return
         depth = shape[self._traversal_axis()]
         if recenter:
@@ -2046,6 +2305,8 @@ class SliceViewer(QWidget):
             self.current_index = int(np.clip(self.current_index, 0, depth - 1))
         self.slice_slider.setMaximum(depth - 1)
         self.slice_slider.setValue(self.current_index)
+        self._update_slice_spin_range()
+        self._sync_slice_spin()
 
     def set_volume(self, volume_data):
         self.volume_data = volume_data
@@ -2056,15 +2317,21 @@ class SliceViewer(QWidget):
         self._perm_shape = None
         self.clear_measurements()
         self.clear_gray_values()
+        if self._clip_state != 'off':
+            self._clip_state = 'off'
+            self._update_clip_button()
         if volume_data is None or not volume_data.is_loaded():
             self.image_view.clear()
             self.slice_slider.setMaximum(0)
+            self._update_slice_spin_range()
+            self._sync_slice_spin()
             return
         self._apply_slider_range(recenter=True)
         self.update_image()
 
     def on_slice_changed(self, value):
         self.current_index = value
+        self._sync_slice_spin()
         self.clear_measurements()
         self.clear_gray_values()
         self.update_image()
@@ -2073,6 +2340,16 @@ class SliceViewer(QWidget):
             ax_idx = self._traversal_axis()
             axis   = {'XY': 'Z', 'YZ': 'X', 'XZ': 'Y'}[self.orientation]
             self.axis_position_changed.emit(axis, value, shape[ax_idx])
+
+    def on_slice_spin_changed(self, value):
+        """Map an edited distance value back to the nearest slice index."""
+        sp = self._traversal_spacing()
+        idx = int(round(value / sp)) if sp > 0 else 0
+        idx = int(np.clip(idx, 0, max(0, self.slice_slider.maximum())))
+        if idx != self.slice_slider.value():
+            self.slice_slider.setValue(idx)   # → on_slice_changed re-syncs the spin
+        else:
+            self._sync_slice_spin()           # snap display back onto the slice grid
 
     def set_preview_transform(self, R, offset, orig_vol):
         """Activate live preview: update_image() will sample orig_vol via R/offset."""
@@ -2237,6 +2514,8 @@ class SliceViewer(QWidget):
             self.point_placed.emit(mapped)
 
     def show_axis_line(self, axis, index, total, seg_range=None):
+        if not self._coord_lines_enabled:
+            return
         # Compute angle + position for this viewport's coordinate space.
         # Vertical (angle=90): the axis is the horizontal dimension here, no flip.
         # Horizontal (angle=0): the axis is the vertical dimension, always flipped ([::-1]).
@@ -2318,15 +2597,23 @@ class SliceViewer(QWidget):
             for timer in self._axis_timers.values():
                 timer.stop()
         else:
-            # Stop timers and remove all lines immediately.
-            for timer in list(self._axis_timers.values()):
-                timer.stop()
-            self._axis_timers.clear()
-            view = self.image_view.getView()
-            for items in list(self._axis_lines.values()):
-                for item in items:
-                    view.removeItem(item)
-            self._axis_lines.clear()
+            self._clear_axis_lines()
+
+    def _clear_axis_lines(self):
+        for timer in list(self._axis_timers.values()):
+            timer.stop()
+        self._axis_timers.clear()
+        view = self.image_view.getView()
+        for items in list(self._axis_lines.values()):
+            for item in items:
+                view.removeItem(item)
+        self._axis_lines.clear()
+
+    def set_coord_lines_enabled(self, enabled):
+        """Enable/disable the coordinate lines in this 2D viewport."""
+        self._coord_lines_enabled = bool(enabled)
+        if not enabled:
+            self._clear_axis_lines()
 
     def map_to_volume_coordinates(self, x, y):
         if self.volume_data is None or self.volume_data.volume is None:
@@ -2358,6 +2645,7 @@ class _GLView(gl.GLViewWidget):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._pick_mode = False
+        self._static = False   # PiP preview: camera fixed, no mouse interaction
         self._view_rot = self._rot_from_opts()
 
     def set_pick_mode(self, enabled):
@@ -2412,6 +2700,9 @@ class _GLView(gl.GLViewWidget):
         self.update()
 
     def mousePressEvent(self, ev):
+        if self._static:
+            ev.accept()
+            return
         # Always track cursor position so drag handling works regardless.
         try:
             lpos = ev.position()
@@ -2430,6 +2721,9 @@ class _GLView(gl.GLViewWidget):
         super().mousePressEvent(ev)
 
     def mouseMoveEvent(self, ev):
+        if self._static:
+            ev.accept()
+            return
         try:
             lpos = ev.position()
         except AttributeError:
@@ -2457,12 +2751,16 @@ class _GLView(gl.GLViewWidget):
 
 class VolumeRender3D(QWidget):
     point_placed = Signal(tuple)
+    planes_toggled = Signal(bool)   # coordinate-planes visibility toggle
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, pip=False):
         super().__init__(parent)
+        self._pip = pip   # picture-in-picture preview: no header/controls, fixed camera
+        self._pip_fit_axes = None   # (horiz, vert, depth) volume axes for camera fit
         self.volume_data = None
         self.orientation = '3D'
         self.mode = 'Isosurface'
+        self._show_planes = True
         self._alignment_mode = False
         self._alignment_points = []   # voxel-coord tuples
         self._alignment_gl_items = [] # live GL items for overlays
@@ -2474,7 +2772,23 @@ class VolumeRender3D(QWidget):
         self._display_levels = None   # (lo, hi) window from the histogram, or None
         self._perm_volume = None      # permanent aligned display volume (non-destructive)
         self._quality = 'Default'     # 'Low' 256³, 'Default' 512³ (2×), 'High' 1024³ (4×)
+        self._clips = {}              # axis(0/1/2) -> ('left'|'right', fraction)
+        # Caches so slice-drag clipping just hides geometry/voxels rather than
+        # recomputing the surface or re-normalising the volume each frame.
+        self._iso_cache = None        # (verts, faces) from the FULL volume
+        self._iso_cache_key = None
+        self._rgba_base = None        # full-volume RGBA (original alpha)
+        self._rgba_cache_key = None
+        self._plane_fracs = {}        # axis(0/1/2) -> slice fraction [0,1]
+        # axis -> {in-plane axis: (lo,hi)} normalised visible extent of the
+        # matching 2D viewport (zoom/pan/FOV); empty → full-volume extent.
+        self._plane_rects = {}
+        self._plane_items = []        # GL items for the coordinate planes + frames
         self.init_ui()
+        # Debounce clip re-renders so dragging a slice stays responsive.
+        self._clip_timer = QtCore.QTimer(self)
+        self._clip_timer.setSingleShot(True)
+        self._clip_timer.timeout.connect(lambda: self._render_scene(reset_camera=False))
 
     def init_ui(self):
         layout = QVBoxLayout(self)
@@ -2510,10 +2824,21 @@ class VolumeRender3D(QWidget):
         header.addWidget(QLabel('Isovalue:'))
         header.addWidget(self.iso_slider)
         header.addWidget(self.iso_spinbox)
+        header.addSpacing(4)
+        self.planes_button = QPushButton()
+        self.planes_button.setCheckable(True)
+        self.planes_button.setChecked(self._show_planes)
+        self.planes_button.setFixedSize(24, 24)
+        self.planes_button.setIconSize(QtCore.QSize(16, 16))
+        self.planes_button.setIcon(_coord_axes_icon())
+        self.planes_button.setToolTip('Show coordinate planes')
+        self.planes_button.toggled.connect(self.planes_toggled)
+        header.addWidget(self.planes_button)
         header.addStretch()
         self.maximize_button = QPushButton('▲')
         self.maximize_button.setFixedSize(24, 24)
         header.addWidget(self.maximize_button)
+        self.header_bar = header_bar
         layout.addWidget(header_bar)
 
         self.gl_view = _GLView()
@@ -2530,6 +2855,16 @@ class VolumeRender3D(QWidget):
         self.gl_view.pick_requested.connect(self._on_gl_pick)
         self.gl_view.installEventFilter(self)
 
+        # Overlay hint shown while clipping is active (mirrors the 2D
+        # "Auto Min Max is on" note: same style, same top-right position).
+        self.clip_hint = QLabel('Clipping is on', self.gl_view)
+        self.clip_hint.setStyleSheet(
+            'color: #FFD400; background: rgba(0,0,0,120);'
+            'padding: 2px 6px; border-radius: 3px; font-size: 11px;')
+        self.clip_hint.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.clip_hint.adjustSize()
+        self.clip_hint.hide()
+
         self.status_text = QLabel('')
         self.status_text.setStyleSheet('color: red;')
 
@@ -2538,13 +2873,29 @@ class VolumeRender3D(QWidget):
         bottom = QHBoxLayout(bottom_bar)
         bottom.setContentsMargins(2, 2, 2, 2)
         bottom.addWidget(self.status_text, 1)
+        self.bottom_bar = bottom_bar
         layout.addWidget(bottom_bar)
+
+        # PiP preview: chrome-free, fixed camera, a thin frame to set it apart.
+        if self._pip:
+            self.header_bar.hide()
+            self.bottom_bar.hide()
+            self.gl_view._static = True
+            self.gl_view.setContextMenuPolicy(Qt.NoContextMenu)
+            self.tripod.hide()
+            self.setStyleSheet('VolumeRender3D { border: 1px solid #888; }')
 
     def eventFilter(self, obj, event):
         if obj is self.gl_view:
             et = event.type()
+            # PiP preview: fixed camera — swallow wheel/gesture zoom.
+            if self._pip and et in (_EV_WHEEL, _EV_NATIVE_GESTURE):
+                return True
             if et == _EV_RESIZE:
                 self._reposition_tripod()
+                self._reposition_clip_hint()
+                if self._pip:
+                    self._fit_pip_camera()   # re-fit on PiP resize (aspect change)
             elif et == _EV_MOUSE_MOVE:
                 QtCore.QTimer.singleShot(0, self.tripod.update)
             elif et == _EV_WHEEL:
@@ -2570,6 +2921,36 @@ class VolumeRender3D(QWidget):
         m = 6
         self.tripod.move(m, self.gl_view.height() - self.tripod.height() - m)
         self.tripod.raise_()
+
+    def _reposition_clip_hint(self):
+        m = 6
+        self.clip_hint.adjustSize()
+        self.clip_hint.move(self.gl_view.width() - self.clip_hint.width() - m, m)
+        self.clip_hint.raise_()
+
+    def _fit_pip_camera(self):
+        """Pull the camera in so the volume's bounding box fills the PiP view.
+
+        Fits the front face (nearest under perspective) of the box to whichever
+        screen dimension is more constraining, given the view's two visible axes.
+        """
+        if not self._pip or self._pip_fit_axes is None or self._render_shape is None:
+            return
+        h_ax, v_ax, d_ax = self._pip_fit_axes
+        shape = self._render_shape
+        if min(shape) <= 0:
+            return
+        half_w = shape[h_ax] / 2.0
+        half_h = shape[v_ax] / 2.0
+        depth  = shape[d_ax]
+        gl = self.gl_view
+        vp_w, vp_h = max(1, gl.width()), max(1, gl.height())
+        thf = math.tan(math.radians(gl.opts['fov']) * 0.5)   # horizontal half-FOV
+        # Visible half-extent at distance d: horizontal d*thf, vertical d*thf*(h/w).
+        d_h = half_w / thf
+        d_v = half_h * (vp_w / vp_h) / thf
+        dist = max(d_h, d_v) + depth / 2.0      # +depth/2: nearest face under perspective
+        gl.setCameraPosition(distance=dist * 1.05)   # tiny margin so it just touches
 
     # ── Alignment helpers ────────────────────────────────────────────────────
 
@@ -2870,6 +3251,7 @@ class VolumeRender3D(QWidget):
         self.volume_data = volume_data
         self._perm_volume = None
         self._display_levels = None
+        self._clips = {}
         self.update_view()
 
     def set_levels(self, min_val, max_val):
@@ -2914,11 +3296,150 @@ class VolumeRender3D(QWidget):
         self._quality = quality
         self.update_view()
 
+    def set_clips(self, clips):
+        """Set active clipping planes: {axis(0/1/2): ('left'|'right', fraction)}.
+
+        Re-renders the cached volume (debounced) without disturbing the camera.
+        """
+        self._clips = dict(clips)
+        active = bool(self._clips)
+        self.clip_hint.setVisible(active)
+        if active:
+            self._reposition_clip_hint()
+        if self._render_volume is None:
+            return
+        if not self._clip_timer.isActive():
+            self._clip_timer.start(80)
+
+    # ── Coordinate planes (3D analogue of the 2D coordinate lines) ────────────
+    # Plane colours match the 2D slice/line colours: the YZ plane (fixed X) is
+    # red, the XZ plane (fixed Y) green, the XY plane (fixed Z) blue.
+    _PLANE_COLORS = {0: (217, 74, 74), 1: (74, 181, 74), 2: (74, 144, 217)}
+
+    def set_coord_planes(self, fracs, rects=None):
+        """Show coordinate planes at the given slice fractions {axis: frac}.
+
+        ``rects`` optionally gives each plane's in-plane extent as
+        {axis: {in-plane axis: (lo, hi)}} in normalised [0,1] volume coords, so
+        the plane tracks the zoom/pan/FOV of the matching 2D viewport.
+        """
+        self._plane_fracs = dict(fracs)
+        self._plane_rects = dict(rects or {})
+        self._draw_coord_planes()
+
+    def set_planes_visible(self, visible):
+        """Enable/disable the coordinate planes."""
+        self._show_planes = bool(visible)
+        self._draw_coord_planes()
+
+    def _draw_coord_planes(self):
+        for it in self._plane_items:
+            try:
+                self.gl_view.removeItem(it)
+            except Exception:
+                pass
+        self._plane_items = []
+        if not self._show_planes or self._render_volume is None or not self._plane_fracs:
+            return
+        shape = self._render_shape
+        # A depth pre-pass (write only the nearest plane's depth, no colour)
+        # followed by an equal-depth colour pass means exactly ONE plane — the
+        # nearest at each pixel — colours that pixel. So intersecting planes
+        # never blend (no red+green=yellow), regardless of viewing angle.
+        # A depth-buffer clear isolates this from the volume/surface depth:
+        #   Isosurface: planes drawn BEFORE the surface, then depth cleared, so
+        #     the opaque surface always ends up in front of them.
+        #   Phong: volume drawn first, depth cleared, then planes over it (faint,
+        #     so the opaque volume still reads through).
+        phong = self.mode != 'Isosurface'
+        fill_alpha = 0.10 if phong else 0.22
+        if phong:
+            clear_dv, depth_dv, color_dv = 1, 2, 3          # after the volume (0)
+        else:
+            depth_dv, color_dv, clear_dv = -20, -15, -10    # before the surface (0)
+
+        clear = _GLDepthClear()
+        clear.setDepthValue(clear_dv)
+        self.gl_view.addItem(clear)
+        self._plane_items.append(clear)
+
+        for ax, frac in self._plane_fracs.items():
+            sa = shape[ax]
+            pos = frac * (sa - 1) - sa / 2.0
+            b, c = [i for i in (0, 1, 2) if i != ax]
+
+            # In-plane extent: the visible window of the matching 2D viewport
+            # (normalised [0,1]), defaulting to the full volume extent. Centred
+            # on the volume so frac 0→-shape/2 and frac 1→+shape/2.
+            rect = self._plane_rects.get(ax, {})
+            blo_n, bhi_n = rect.get(b, (0.0, 1.0))
+            clo_n, chi_n = rect.get(c, (0.0, 1.0))
+            blo = (blo_n - 0.5) * shape[b]
+            bhi = (bhi_n - 0.5) * shape[b]
+            clo = (clo_n - 0.5) * shape[c]
+            chi = (chi_n - 0.5) * shape[c]
+
+            def corner(bv, cv):
+                p = [0.0, 0.0, 0.0]
+                p[ax] = pos
+                p[b] = bv
+                p[c] = cv
+                return p
+
+            verts = np.array([corner(blo, clo), corner(bhi, clo),
+                              corner(bhi, chi), corner(blo, chi)], dtype=np.float32)
+            faces = np.array([[0, 1, 2], [0, 2, 3]])
+            r, g, bl = self._PLANE_COLORS[ax]
+            color = (r / 255.0, g / 255.0, bl / 255.0, fill_alpha)
+
+            # Pass 1: depth only (no colour) — records the nearest plane depth.
+            depth_md = gl.MeshData(vertexes=verts, faces=faces)
+            depth_plane = gl.GLMeshItem(meshdata=depth_md, smooth=False, drawEdges=False)
+            depth_plane.setGLOptions(_PLANE_DEPTH_GLOPTS)
+            depth_plane.setDepthValue(depth_dv)
+            self.gl_view.addItem(depth_plane)
+            self._plane_items.append(depth_plane)
+
+            # Pass 2: colour, equal-depth test — only the nearest plane draws.
+            color_md = gl.MeshData(vertexes=verts, faces=faces)
+            color_plane = gl.GLMeshItem(meshdata=color_md, smooth=False,
+                                        drawEdges=False, color=color)
+            color_plane.setGLOptions(_PLANE_COLOR_GLOPTS)
+            color_plane.setDepthValue(color_dv)
+            self.gl_view.addItem(color_plane)
+            self._plane_items.append(color_plane)
+
+            # White frame, drawn on top (no depth test) so it shows through the
+            # volume to convey the plane's full extent.
+            loop = np.vstack([verts, verts[0]])
+            frame = gl.GLLinePlotItem(pos=loop, color=(1, 1, 1, 1), width=2,
+                                      antialias=True, mode='line_strip')
+            frame.setGLOptions(_ONTOP_GLOPTS)
+            frame.setDepthValue(20)
+            self.gl_view.addItem(frame)
+            self._plane_items.append(frame)
+
+    def _clip_keep_mask(self, coords, shape):
+        """Boolean keep-mask for points (Nx3 in voxel coords) under active clips.
+
+        Clipping is display-only — it never alters the volume data, it just
+        marks which points/voxels are shown.
+        """
+        keep = np.ones(len(coords), dtype=bool)
+        for ax, (mode, frac) in self._clips.items():
+            plane = frac * (shape[ax] - 1)
+            if mode == 'left':        # hide below the plane
+                keep &= coords[:, ax] >= plane
+            elif mode == 'right':     # hide above the plane
+                keep &= coords[:, ax] <= plane
+        return keep
+
     def update_view(self):
-        self.gl_view.clear()
-        self._alignment_gl_items = []
-        self.status_text.setText('')
         if self.volume_data is None or self.volume_data.volume is None:
+            self.gl_view.clear()
+            self._alignment_gl_items = []
+            self._plane_items = []
+            self.status_text.setText('')
             self._render_factor = 1
             self._render_shape = (1, 1, 1)
             self._render_volume = None
@@ -2938,108 +3459,164 @@ class VolumeRender3D(QWidget):
         self._render_volume = volume
         self._render_vol_min = float(np.min(volume))
         self._render_vol_max = float(np.max(volume))
+        self._render_scene(reset_camera=True)
+
+    def _render_scene(self, reset_camera=False):
+        """(Re)build the 3D scene from the cached render volume + active clips."""
+        self.gl_view.clear()
+        self._alignment_gl_items = []
+        self._plane_items = []        # clear() removed them; _draw re-adds below
+        self.status_text.setText('')
+        volume = self._render_volume
+        if volume is None:
+            return
         if self.mode == 'Isosurface':
             self.render_isosurface(volume)
         else:
             self.render_volume(volume)
-        distance = max(raw.shape) * 2.5
-        self.gl_view.setCameraPosition(distance=distance)
+        if reset_camera:
+            self.gl_view.setCameraPosition(distance=max(self._render_shape) * 2.5)
         self._rebuild_alignment_overlays()
+        self._draw_coord_planes()
 
-    def render_isosurface(self, volume):
+    def render_isosurface(self, volume, translate=None):
         if measure is None:
             self.status_text.setText('Install scikit-image for ISO surface rendering')
             return
         if volume.ndim != 3 or any(dim < 2 for dim in volume.shape):
             self.status_text.setText('3D surface unavailable for this volume')
             return
-        volume_min = float(np.min(volume))
-        volume_max = float(np.max(volume))
+        # Threshold is ALWAYS computed from the full volume's global range, so
+        # clipping (which only hides geometry) never shifts the isovalue.
+        volume_min, volume_max = self._render_vol_min, self._render_vol_max
         if volume_max <= volume_min:
             self.status_text.setText('No surface available for constant volume')
             return
-
         threshold = volume_min + self.iso_threshold_percent / 100.0 * (volume_max - volume_min)
         if not (volume_min < threshold < volume_max):
             self.status_text.setText('ISO threshold out of range')
             return
 
-        try:
-            verts, faces, normals, _ = measure.marching_cubes(volume, level=threshold)
-        except MemoryError:
-            self.status_text.setText('Surface too large to build at this threshold')
-            return
-        except Exception as exc:
-            print('Volume surface error:', exc)
-            self.status_text.setText('No iso-surface found at this threshold')
-            return
+        # Build the full-volume mesh once per (volume, threshold); slice-drag
+        # clipping then just re-filters the cached mesh.
+        key = (id(volume), round(threshold, 6))
+        if self._iso_cache_key != key:
+            try:
+                verts, faces, _normals, _ = measure.marching_cubes(volume, level=threshold)
+            except MemoryError:
+                self.status_text.setText('Surface too large to build at this threshold')
+                return
+            except Exception as exc:
+                print('Volume surface error:', exc)
+                self.status_text.setText('No iso-surface found at this threshold')
+                return
+            if len(verts) > 12_000_000:   # guard against a pathological mesh
+                self.status_text.setText('Surface too complex to display — adjust the isovalue')
+                self._iso_cache = None
+                self._iso_cache_key = None
+                return
+            self._iso_cache = (verts, faces)
+            self._iso_cache_key = key
 
-        # Guard against a pathological surface (huge mesh → RAM blow-up / hang).
-        if len(verts) > 12_000_000:
-            self.status_text.setText(
-                'Surface too complex to display — adjust the isovalue')
+        if self._iso_cache is None:
             return
+        verts, faces = self._iso_cache
+
+        # Hide (don't cut) the clipped part by dropping geometry beyond the plane.
+        if self._clips:
+            keep = self._clip_keep_mask(verts, volume.shape)
+            if not keep.any():
+                return
+            if not keep.all():
+                remap = np.cumsum(keep) - 1
+                fmask = keep[faces].all(axis=1)
+                faces = remap[faces[fmask]]
+                verts = verts[keep]
+            if len(faces) == 0:
+                return
 
         meshdata = gl.MeshData(vertexes=verts, faces=faces)
-        mesh = gl.GLMeshItem(meshdata=meshdata, smooth=True, shader='shaded', drawEdges=False, glOptions='opaque')
-        mesh.translate(-volume.shape[0] / 2.0, -volume.shape[1] / 2.0, -volume.shape[2] / 2.0)
+        mesh = gl.GLMeshItem(meshdata=meshdata, smooth=True, shader='shaded',
+                             drawEdges=False, glOptions='opaque')
+        if translate is None:
+            translate = (-volume.shape[0] / 2.0, -volume.shape[1] / 2.0, -volume.shape[2] / 2.0)
+        mesh.translate(*translate)
         self.gl_view.addItem(mesh)
 
-    def render_volume(self, volume):
+    def _build_rgba(self, volume):
+        """Full-volume RGBA from the global window mapping (no clipping applied)."""
+        vol_min, vol_max = self._render_vol_min, self._render_vol_max
+        if vol_max <= vol_min:
+            return None
+        # Map the histogram window [lo, hi] to [0, 1]; values outside the window
+        # clamp so they become fully transparent / fully opaque.
+        if self._display_levels is not None:
+            lo, hi = self._display_levels
+        else:
+            lo, hi = vol_min, vol_max
+        if hi <= lo:
+            hi = lo + 1e-6
+        normalized = np.clip((volume - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+
+        # Surface normals via volume gradient for Phong-style shading. Compute
+        # one axis at a time, casting to float32, to limit peak RAM.
+        gx = np.gradient(normalized, axis=0).astype(np.float32)
+        gy = np.gradient(normalized, axis=1).astype(np.float32)
+        gz = np.gradient(normalized, axis=2).astype(np.float32)
+        gnorm = np.sqrt(gx ** 2 + gy ** 2 + gz ** 2).astype(np.float32) + 1e-8
+        nx = gx / gnorm; del gx
+        ny = gy / gnorm; del gy
+        nz = gz / gnorm; del gz, gnorm
+        diffuse = np.clip(nx * 0.577 + ny * 0.577 + nz * 0.577, 0.0, 1.0).astype(np.float32)
+        del nx, ny, nz
+        shading = np.clip(0.35 + 0.65 * diffuse, 0.0, 1.0).astype(np.float32)
+        del diffuse
+
+        rgba = np.zeros(normalized.shape + (4,), dtype=np.uint8)
+        gray = np.clip(normalized * shading * 255.0, 0, 255).astype(np.uint8)
+        del shading
+        rgba[..., 0] = gray
+        rgba[..., 1] = gray
+        rgba[..., 2] = gray
+        # Opacity ramp: a gamma < 1 boost makes the material read clearly/solidly
+        # (dense voxels become fully opaque) while low intensity (air) stays
+        # transparent.
+        rgba[..., 3] = np.clip(np.power(normalized, 0.6) * 300.0, 0, 255).astype(np.uint8)
+        return rgba
+
+    def render_volume(self, volume, translate=None):
         try:
             if volume.ndim != 3:
                 self.status_text.setText('Volume rendering requires a 3D scalar volume')
                 return
-            vol_min = float(np.min(volume))
-            vol_max = float(np.max(volume))
-            if vol_max <= vol_min:
+            # Build the full-volume RGBA once per (volume, window); clipping then
+            # just hides voxels by zeroing their alpha (data is untouched).
+            key = (id(volume), self._display_levels)
+            if self._rgba_cache_key != key or self._rgba_base is None:
+                self._rgba_base = self._build_rgba(volume)
+                self._rgba_cache_key = key
+            if self._rgba_base is None:
                 self.status_text.setText('Volume rendering requires a non-constant volume')
                 return
 
-            # Map the histogram window [lo, hi] to [0, 1]; values outside the
-            # window clamp so they become fully transparent / fully opaque.
-            if self._display_levels is not None:
-                lo, hi = self._display_levels
-            else:
-                lo, hi = vol_min, vol_max
-            if hi <= lo:
-                hi = lo + 1e-6
-            normalized = np.clip((volume - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+            rgba = self._rgba_base
+            if self._clips:
+                rgba = rgba.copy()
+                for ax, (mode, frac) in self._clips.items():
+                    n = rgba.shape[ax]
+                    idx = int(round(frac * (n - 1)))
+                    sl = [slice(None)] * 3
+                    if mode == 'left':        # hide below the plane
+                        sl[ax] = slice(0, idx)
+                    elif mode == 'right':     # hide above the plane
+                        sl[ax] = slice(idx + 1, n)
+                    rgba[tuple(sl) + (3,)] = 0     # alpha → 0 (future: semi-transparent)
 
-            # Estimate surface normals via volume gradient for Phong-style shading.
-            # Compute one axis at a time and cast to float32 immediately to avoid
-            # np.gradient's float64 promotion holding 3× full-volume arrays at once.
-            gx = np.gradient(normalized, axis=0).astype(np.float32)
-            gy = np.gradient(normalized, axis=1).astype(np.float32)
-            gz = np.gradient(normalized, axis=2).astype(np.float32)
-            gnorm = np.sqrt(gx ** 2 + gy ** 2 + gz ** 2).astype(np.float32) + 1e-8
-            nx = gx / gnorm; del gx
-            ny = gy / gnorm; del gy
-            nz = gz / gnorm; del gz, gnorm
-
-            # Diffuse term from a fixed overhead-diagonal light (1,1,1) normalised
-            diffuse = np.clip(nx * 0.577 + ny * 0.577 + nz * 0.577, 0.0, 1.0).astype(np.float32)
-            del nx, ny, nz
-            shading = np.clip(0.35 + 0.65 * diffuse, 0.0, 1.0).astype(np.float32)
-            del diffuse
-
-            rgba = np.zeros(normalized.shape + (4,), dtype=np.uint8)
-            gray = np.clip(normalized * shading * 255.0, 0, 255).astype(np.uint8)
-            del shading
-            rgba[..., 0] = gray
-            rgba[..., 1] = gray
-            rgba[..., 2] = gray
-            # Alpha ramps with intensity so air/background stays transparent
-            rgba[..., 3] = np.clip(normalized * 220.0, 0, 220).astype(np.uint8)
-            del normalized, gray
-
-            vol_item = gl.GLVolumeItem(
-                rgba,
-                sliceDensity=1,
-                smooth=True,
-                glOptions='translucent',
-            )
-            vol_item.translate(-rgba.shape[0] / 2.0, -rgba.shape[1] / 2.0, -rgba.shape[2] / 2.0)
+            vol_item = gl.GLVolumeItem(rgba, sliceDensity=1, smooth=True,
+                                       glOptions='translucent')
+            if translate is None:
+                translate = (-rgba.shape[0] / 2.0, -rgba.shape[1] / 2.0, -rgba.shape[2] / 2.0)
+            vol_item.translate(*translate)
             self.gl_view.addItem(vol_item)
         except Exception as exc:
             print('Volume render failed:', exc)
@@ -3059,6 +3636,9 @@ class VolumeRender3D(QWidget):
             vol_ds = raw[::factor, ::factor, ::factor]
         else:
             vol_ds = raw
+        # The render methods read the global range from these fields.
+        self._render_vol_min = float(np.min(vol_ds))
+        self._render_vol_max = float(np.max(vol_ds))
         if self.mode == 'Isosurface':
             self.render_isosurface(vol_ds)
         else:
@@ -3541,7 +4121,17 @@ class MainWindow(QMainWindow):
         self._alignment_dialog = None
         self._sync_locked = bool(self.preferences.get('sync_locked', True))
         self._syncing = False
+        # In unlocked mode only the most-recently-moved slider's coordinate
+        # plane is shown in 3D; it auto-hides after the same 3s timeout as the
+        # 2D coordinate lines. (Locked mode always shows all three planes.)
+        self._active_plane_axis = None
+        self._plane_hide_timer = QtCore.QTimer(self)
+        self._plane_hide_timer.setSingleShot(True)
+        self._plane_hide_timer.timeout.connect(self._on_plane_hide_timeout)
         self._project_source = None
+        self._project_path = None    # saved .voxels path; None ⇒ unsaved "New Project"
+        self._dirty = False          # unsaved changes to an opened project
+        self._loading = False        # suppress dirty-marking during project restore
         # Single cumulative view-time alignment (output→input, scipy convention
         # in = R @ out + offset). Applied at display time; the voxel data is
         # never modified. _align_active is False when showing the raw volume.
@@ -3553,6 +4143,7 @@ class MainWindow(QMainWindow):
         self.create_menu()
         self._apply_theme()
         self._restore_layout()
+        self._update_title()
 
         # Debounce the (expensive) Phong 3D re-render while the window slider is
         # dragged — fires once the user pauses.
@@ -3568,6 +4159,47 @@ class MainWindow(QMainWindow):
     def _on_escape(self):
         if self.left_panel.auto_minmax_btn.isChecked():
             self.left_panel.auto_minmax_btn.setChecked(False)
+
+    # ── Project title / unsaved-changes tracking ──────────────────────────────
+    def _project_display_name(self):
+        if self._project_path:
+            return os.path.splitext(os.path.basename(self._project_path))[0]
+        return 'New Project'
+
+    def _update_title(self):
+        self.setWindowTitle(f'{APP_NAME} {APP_VERSION} - {self._project_display_name()}')
+
+    def _mark_dirty(self):
+        """Flag unsaved changes (ignored while a project is being restored)."""
+        if not self._loading:
+            self._dirty = True
+
+    def _start_new_project(self):
+        """Reset to an unsaved 'New Project' (e.g. after a fresh import)."""
+        self._project_path = None
+        self._dirty = False
+        self._update_title()
+
+    def _needs_save_prompt(self):
+        # Prompt for an unsaved New Project (with content) or a modified open project.
+        return self.volume_data.is_loaded() and (self._project_path is None or self._dirty)
+
+    def closeEvent(self, event):
+        if self._needs_save_prompt():
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.NoIcon)   # no question-mark icon
+            box.setWindowTitle(APP_NAME)
+            box.setText('Save the current project?')
+            box.setStandardButtons(QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+            box.setDefaultButton(QMessageBox.Yes)
+            ans = box.exec()
+            if ans == QMessageBox.Cancel:
+                event.ignore()
+                return
+            if ans == QMessageBox.Yes and not self.save_voxels_project():
+                event.ignore()    # save dialog cancelled / failed → don't quit
+                return
+        super().closeEvent(event)
 
     def setup_ui(self):
         central = QWidget(self)
@@ -3586,6 +4218,9 @@ class MainWindow(QMainWindow):
         self.view_yz = SliceViewer('YZ', self)
         self.view_xz = SliceViewer('XZ', self)
         self.view_3d = VolumeRender3D(self)
+        # Shared picture-in-picture 3D preview, overlaid on a maximized 2D viewport.
+        self.pip_3d = VolumeRender3D(self, pip=True)
+        self.pip_3d.hide()
 
         grid_layout.addWidget(self.view_xy, 0, 0)
         grid_layout.addWidget(self.view_yz, 0, 1)
@@ -3619,6 +4254,29 @@ class MainWindow(QMainWindow):
         self.view_xz.point_placed.connect(self.on_point_placed)
         self.view_3d.point_placed.connect(self.on_point_placed)
 
+        # 3D render mode / isovalue changes count as project changes.
+        self.view_3d.mode_combo.currentTextChanged.connect(lambda *_: self._mark_dirty())
+        self.view_3d.iso_slider.valueChanged.connect(lambda *_: self._mark_dirty())
+
+        # 2D toggle: coordinate lines in the 2D viewports (linked across them).
+        for v in (self.view_xy, self.view_yz, self.view_xz):
+            v.planes_toggled.connect(self._on_coord_lines_toggled)
+        # 3D toggle: coordinate planes in the 3D view only.
+        self.view_3d.planes_toggled.connect(self._on_coord_planes_toggled)
+
+        # Restore the saved visibility states (default: 2D lines on, 3D planes off).
+        lines_on = bool(self.preferences.get('coord_lines_visible', True))
+        planes_on = bool(self.preferences.get('coord_planes_visible', False))
+        for sv in (self.view_xy, self.view_yz, self.view_xz):
+            sv.planes_button.blockSignals(True)
+            sv.planes_button.setChecked(lines_on)
+            sv.planes_button.blockSignals(False)
+            sv.set_coord_lines_enabled(lines_on)
+        self.view_3d.planes_button.blockSignals(True)
+        self.view_3d.planes_button.setChecked(planes_on)
+        self.view_3d.planes_button.blockSignals(False)
+        self.view_3d.set_planes_visible(planes_on)
+
         self.left_panel.auto_minmax_toggled.connect(self.view_xy.set_auto_mode)
         self.left_panel.auto_minmax_toggled.connect(self.view_yz.set_auto_mode)
         self.left_panel.auto_minmax_toggled.connect(self.view_xz.set_auto_mode)
@@ -3642,6 +4300,7 @@ class MainWindow(QMainWindow):
                 lambda sv=sv: self._on_lock_clicked(sv))
             sv.set_measurement_tool(meas_tool)
             sv.measurement_tool_changed.connect(self._on_measurement_tool_changed)
+            sv.clip_changed.connect(self._update_clips)
 
         self.maximized_widget = None
         self._current_layout = 'Classic'
@@ -3687,6 +4346,19 @@ class MainWindow(QMainWindow):
         layout_menu.addAction(classic_action)
         layout_menu.addAction(engineering_action)
 
+        interp_menu = view_menu.addMenu('Voxels Interpolation')
+        interp_group = QtWidgets.QActionGroup(interp_menu)
+        interp_group.setExclusive(True)
+        interp_on = bool(self.preferences.get('voxel_interpolation', False))
+        for label, val in (('Off', False), ('On', True)):
+            act = interp_menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(interp_on == val)
+            interp_group.addAction(act)
+            act.triggered.connect(lambda _c=False, v=val: self._on_interpolation_changed(v))
+        for sv in self._slice_viewers():
+            sv.set_interpolation(interp_on)
+
         operations_menu = menubar.addMenu('&Operations')
         alignment_menu = operations_menu.addMenu('Alignment')
         simple_align = QtWidgets.QAction('Simple Alignment...', self)
@@ -3721,7 +4393,12 @@ class MainWindow(QMainWindow):
             grid_layout.addWidget(widget, 0, 0, 2, 2)
             self.maximized_widget = widget
             widget.maximize_button.setText('▼')
+            # A maximized 2D viewport gets a 3D PiP aligned to its orientation.
+            if widget in (self.view_xy, self.view_yz, self.view_xz):
+                self._show_pip_for(widget)
         else:
+            if isinstance(self.maximized_widget, SliceViewer):
+                self.maximized_widget.detach_pip()
             grid_layout.removeWidget(widget)
             for v in viewers:
                 r, c = positions[v]
@@ -3730,6 +4407,53 @@ class MainWindow(QMainWindow):
             self.maximized_widget.maximize_button.setText('▲')
             self.maximized_widget = None
         self._save_layout_prefs()
+
+    # Camera angles (azimuth, elevation) for each maximized 2D viewport's PiP.
+    # Looking directions: XY side = from +Z (top, -90/90); XZ side = along +Y
+    # (90/0). Per the chosen mapping: XY→XZ side, XZ→XY side, YZ→XZ side.
+    _PIP_CAMERA = {'XY': (90.0, 0.0), 'XZ': (-90.0, 90.0), 'YZ': (90.0, 0.0)}
+    # Volume axes (horizontal, vertical, depth) facing the camera for each PiP,
+    # used to fit the bounding box to the view. XZ side → X,Z visible / Y depth;
+    # XY side (top) → X,Y visible / Z depth.
+    _PIP_FIT_AXES = {'XY': (0, 2, 1), 'XZ': (0, 1, 2), 'YZ': (0, 2, 1)}
+
+    def _show_pip_for(self, viewer):
+        """Configure and overlay the 3D PiP preview for a maximized 2D viewport."""
+        pip, src = self.pip_3d, self.view_3d
+        # Mirror what the main 3D view is rendering.
+        pip.volume_data    = src.volume_data
+        pip._perm_volume   = src._perm_volume
+        pip.mode           = src.mode
+        pip._quality       = src._quality
+        pip._display_levels = src._display_levels
+        pip.iso_threshold_percent = src.iso_threshold_percent
+        pip.update_view()
+        # Lock the camera to the maximized viewport's orientation.
+        az, el = self._PIP_CAMERA.get(viewer.orientation, (-45.0, 30.0))
+        pip.gl_view.opts['azimuth'] = az
+        pip.gl_view.opts['elevation'] = el
+        pip.gl_view.sync_rot_from_opts()
+        # Fit the camera so the volume's bounding box fills the PiP.
+        pip._pip_fit_axes = self._PIP_FIT_AXES.get(viewer.orientation)
+        pip.gl_view.update()
+        # Show only this viewport's coordinate plane, moving with its slider.
+        pip.set_planes_visible(True)
+        viewer.attach_pip(pip)       # resizes the PiP → triggers a fit
+        pip._fit_pip_camera()
+        self._update_pip_plane()
+
+    def _update_pip_plane(self):
+        """Sync the PiP's single coordinate plane to the maximized viewport's slice."""
+        w = self.maximized_widget
+        if self._pip_inactive(w):
+            return
+        info = w.slice_fraction()
+        if info is not None:
+            self.pip_3d.set_coord_planes({info[0]: info[1]})
+
+    def _pip_inactive(self, w):
+        return (w is None or not isinstance(w, SliceViewer)
+                or w._pip is not self.pip_3d)
 
     def _apply_layout(self, name):
         if name == self._current_layout:
@@ -3755,6 +4479,12 @@ class MainWindow(QMainWindow):
         self._layout_positions = new_positions
         self._current_layout = name
         self._save_layout_prefs()
+
+    def _on_interpolation_changed(self, enabled):
+        for sv in self._slice_viewers():
+            sv.set_interpolation(enabled)
+        self.preferences['voxel_interpolation'] = bool(enabled)
+        _save_prefs(self.preferences)
 
     def _save_import_dir(self, file_path: str) -> None:
         self.preferences['last_import_dir'] = os.path.dirname(os.path.abspath(file_path))
@@ -3874,6 +4604,7 @@ class MainWindow(QMainWindow):
                 'voxel_size': list(voxels), 'dtype': str(np.dtype(dtype)),
             }
         self.update_views()
+        self._start_new_project()
 
     def import_volume(self):
         start_dir = self.preferences.get('last_import_dir', '')
@@ -3918,6 +4649,7 @@ class MainWindow(QMainWindow):
                 'voxel_size': list(voxels), 'dtype': str(np.dtype(dtype)),
             }
         self.update_views()
+        self._start_new_project()
 
     # ── Project save / open ───────────────────────────────────────────────────
 
@@ -3951,15 +4683,16 @@ class MainWindow(QMainWindow):
         gv.update()
 
     def save_voxels_project(self):
+        """Save the project. Returns True on success, False if cancelled/failed."""
         if not self.volume_data.is_loaded() or self._project_source is None:
             QMessageBox.warning(self, 'Save Project',
                                 'No volume loaded. Please import data first.')
-            return
-        start_dir = self.preferences.get('last_import_dir', '')
+            return False
+        start_dir = self._project_path or self.preferences.get('last_import_dir', '')
         path, _ = QFileDialog.getSaveFileName(
             self, 'Save Voxels Project', start_dir, 'Voxels Project (*.voxels)')
         if not path:
-            return
+            return False
         if not path.endswith('.voxels'):
             path += '.voxels'
 
@@ -4004,6 +4737,12 @@ class MainWindow(QMainWindow):
                 json.dump(project, f, indent=2)
         except OSError as exc:
             QMessageBox.critical(self, 'Save Failed', str(exc))
+            return False
+        self._project_path = path
+        self._dirty = False
+        self._save_import_dir(path)
+        self._update_title()
+        return True
 
     def open_voxels_project(self):
         start_dir = self.preferences.get('last_import_dir', '')
@@ -4055,6 +4794,7 @@ class MainWindow(QMainWindow):
             return
 
         volume, voxels = result
+        self._loading = True   # suppress dirty-marking while restoring state
         self.volume_data.set_volume(volume, tuple(voxels))
         self._project_source = project['source']
         self._save_import_dir(path)
@@ -4106,6 +4846,12 @@ class MainWindow(QMainWindow):
         cam = project.get('camera')
         if cam:
             self._restore_camera(cam)
+
+        # Restore complete: this is now a clean, saved project.
+        self._loading = False
+        self._project_path = path
+        self._dirty = False
+        self._update_title()
 
     def _load_volume_from_source(self, src, project_dir, on_progress=None):
         """Load a volume from a project source dict. Returns (ndarray, voxel_size)."""
@@ -4344,12 +5090,18 @@ class MainWindow(QMainWindow):
                 float(self.volume_data.bin_edges[-1]),
                 integer=np.issubdtype(self.volume_data.dtype, np.integer),
             )
+        self._update_coord_planes()
+        # Refresh the PiP if a 2D viewport is maximized (e.g. volume changed).
+        if isinstance(self.maximized_widget, SliceViewer) and \
+                self.maximized_widget._pip is self.pip_3d:
+            self._show_pip_for(self.maximized_widget)
 
     def on_curve_changed(self, curve):
         if not self.volume_data.is_loaded() or len(curve) < 4:
             return
         min_val = curve[1][0]
         max_val = curve[2][0]
+        self._mark_dirty()
         for viewer in (self.view_xy, self.view_yz, self.view_xz):
             viewer.set_levels(min_val, max_val)   # fast LUT update, no re-slice
         self.view_3d.set_levels(min_val, max_val)
@@ -4480,6 +5232,21 @@ class MainWindow(QMainWindow):
         return None
 
     def _on_axis_position_changed(self, source_viewer, axis, index, total):
+        self._mark_dirty()
+        # A slice move updates any active clipping plane + the 3D coord planes.
+        # In unlocked mode, only the moving viewport's plane is shown in 3D, and
+        # it auto-hides after the same timeout as the 2D coordinate lines.
+        if not self._sync_locked:
+            info = source_viewer.slice_fraction()
+            self._active_plane_axis = info[0] if info is not None else None
+            self._plane_hide_timer.start(3000)
+        else:
+            self._plane_hide_timer.stop()
+        self._update_clips()
+        self._update_coord_planes()
+        # Keep the PiP's coordinate plane in step with the maximized slider.
+        if source_viewer is self.maximized_widget:
+            self._update_pip_plane()
         vol_shape = self._display_shape()
         if vol_shape is None:
             return
@@ -4500,6 +5267,89 @@ class MainWindow(QMainWindow):
         finally:
             self._syncing = False
 
+    def _update_clips(self):
+        """Collect each 2D viewport's clip state and push them to the 3D view."""
+        clips = {}
+        for sv in self._slice_viewers():
+            info = sv.clip_info()
+            if info is not None:
+                ax, mode, frac = info
+                clips[ax] = (mode, frac)
+        self.view_3d.set_clips(clips)
+
+    def _update_coord_planes(self):
+        """Push each 2D viewport's slice position to the 3D coordinate planes."""
+        vol_shape = self._display_shape()
+        fracs = {}
+        rects = {}
+        for sv in self._slice_viewers():
+            info = sv.slice_fraction()
+            if info is not None:
+                fracs[info[0]] = info[1]
+                if vol_shape is not None:
+                    rects[info[0]] = self._plane_extent_norm(sv, vol_shape)
+        # Unlocked: show only the plane whose slider was last moved; show none
+        # before any move and after the auto-hide timeout (mirrors the 2D lines).
+        if not self._sync_locked:
+            if self._active_plane_axis is None:
+                fracs = {}
+            else:
+                fracs = {k: v for k, v in fracs.items() if k == self._active_plane_axis}
+        rects = {k: rects[k] for k in fracs if k in rects}
+        self.view_3d.set_coord_planes(fracs, rects)
+
+    def _plane_extent_norm(self, viewer, vol_shape):
+        """Normalised [0,1] visible extent of ``viewer``'s plane along each of
+        its two in-plane volume axes → {axis: (lo, hi)}.
+
+        Mirrors the 2D plot↔volume mapping (plot-x = raw, plot-y = flipped):
+          XY → X, Y ;  YZ → Y, Z ;  XZ → X, Z.
+        """
+        nx, ny, nz = vol_shape
+        (px0, px1), (py0, py1) = viewer.image_view.getView().getViewBox().viewRange()
+
+        def nrm(lo, hi, n):
+            lo, hi = (lo, hi) if lo <= hi else (hi, lo)
+            return (max(0.0, lo / n), min(1.0, hi / n))
+
+        o = viewer.orientation
+        if o == 'XY':   # plot-x = X, plot-y = flipped-Y
+            return {0: nrm(px0, px1, nx),
+                    1: nrm(ny - 1 - py1, ny - 1 - py0, ny)}
+        if o == 'YZ':   # plot-x = Y, plot-y = flipped-Z
+            return {1: nrm(px0, px1, ny),
+                    2: nrm(nz - 1 - py1, nz - 1 - py0, nz)}
+        if o == 'XZ':   # plot-x = X, plot-y = flipped-Z
+            return {0: nrm(px0, px1, nx),
+                    2: nrm(nz - 1 - py1, nz - 1 - py0, nz)}
+        return {}
+
+    def _on_plane_hide_timeout(self):
+        """Auto-hide the unlocked single 3D plane (in sync with the 2D lines)."""
+        self._active_plane_axis = None
+        self._update_coord_planes()
+
+    def _on_coord_lines_toggled(self, visible):
+        """Link the 2D coordinate-line toggles and apply to all 2D viewports."""
+        for sv in self._slice_viewers():
+            b = sv.planes_button
+            if b.isChecked() != visible:
+                b.blockSignals(True)
+                b.setChecked(visible)
+                b.blockSignals(False)
+            sv.set_coord_lines_enabled(visible)
+        # Draw the lines immediately on enable (don't wait for a slice/zoom event).
+        if visible:
+            self._show_all_coord_lines()
+        self.preferences['coord_lines_visible'] = bool(visible)
+        _save_prefs(self.preferences)
+
+    def _on_coord_planes_toggled(self, visible):
+        """Show/hide the 3D coordinate planes and remember the choice."""
+        self.view_3d.set_planes_visible(visible)
+        self.preferences['coord_planes_visible'] = bool(visible)
+        _save_prefs(self.preferences)
+
     def _on_measurement_tool_changed(self, kind):
         """Persist the chosen measurement tool and keep all viewports in sync."""
         self.preferences['measurement_tool'] = kind
@@ -4508,9 +5358,15 @@ class MainWindow(QMainWindow):
             sv.set_measurement_tool(kind)
 
     def _on_lock_clicked(self, source_viewer):
+        self._mark_dirty()
         self._sync_locked = not self._sync_locked
         self.preferences['sync_locked'] = self._sync_locked
         _save_prefs(self.preferences)
+        # Reset the unlocked single-plane focus: locked shows all planes;
+        # unlocked shows none until a slider is moved (then auto-hides).
+        self._active_plane_axis = None
+        self._plane_hide_timer.stop()
+        self._update_coord_planes()
         for sv in self._slice_viewers():
             sv.set_locked(self._sync_locked)
             sv.set_lines_pinned(self._sync_locked)
@@ -4524,9 +5380,9 @@ class MainWindow(QMainWindow):
                 self._center_all_on_intersection(W, H)
             finally:
                 self._syncing = False
-            self._show_all_locked_lines()
+            self._show_all_coord_lines()
 
-    def _show_all_locked_lines(self):
+    def _show_all_coord_lines(self):
         sources = [
             (self.view_xy, 'Z', 2),
             (self.view_yz, 'X', 0),
@@ -4545,6 +5401,7 @@ class MainWindow(QMainWindow):
                 viewer.show_axis_line(axis, index, total, seg)
 
     def _on_viewport_range_changed(self, source_viewer):
+        self._mark_dirty()
         # Zoom/pan in one viewport surfaces this viewport's coordinate line in
         # the others (and refreshes its solid segment). Always show — in
         # unlocked mode this triggers their appearance and the auto-hide timer;
@@ -4559,6 +5416,12 @@ class MainWindow(QMainWindow):
                                               viewer.orientation, vol_shape)
                 viewer.show_axis_line(axis, source_viewer.current_index,
                                      vol_shape[ax_idx], seg)
+            # The 3D coordinate plane resizes/shifts with this viewport's zoom &
+            # pan. Unlocked: surface its plane and (re)start the auto-hide timer.
+            if not self._sync_locked:
+                self._active_plane_axis = ax_idx
+                self._plane_hide_timer.start(3000)
+            self._update_coord_planes()
 
         # Propagate zoom/pan to all viewports when locked (centered on intersection).
         if not self._sync_locked or self._syncing:
@@ -4764,6 +5627,7 @@ class MainWindow(QMainWindow):
     def _set_view_alignment(self, R, offset, out_shape):
         """Make (R, offset, out_shape) the active cumulative alignment and push it
         to every viewport as a non-destructive, view-time transform."""
+        self._mark_dirty()
         self._align_active = True
         self._align_R      = np.asarray(R,      dtype=np.float64)
         self._align_offset = np.asarray(offset, dtype=np.float64)
@@ -4795,6 +5659,7 @@ class MainWindow(QMainWindow):
         """User action: drop the view-time alignment and show the raw volume."""
         if not self.volume_data.is_loaded():
             return
+        self._mark_dirty()
         self._reset_alignment_state()
         for sv in self._slice_viewers():
             sv.clear_permanent_transform()
