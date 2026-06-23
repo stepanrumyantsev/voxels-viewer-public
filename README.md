@@ -40,6 +40,18 @@ forward/backward-compatibility checks.
   measurable performance cost. Remembered between sessions (default Off).
 - Orientation tripod overlay in each viewport.
 
+### Project Structure (sidebar)
+A hierarchical tree above the histogram gives an overview of the project and its
+derived items:
+- **Volume** (top, voxels icon) — **renamable** (right-click → Rename or F2; the
+  name is derived from the imported file(s) and saved with the project).
+  Right-click → **Properties…** opens **Volume Information**.
+- **Alignments** — the alignment history (see below); each entry has a tripod
+  icon and the active one is marked **(active)**.
+- **Measurements** and **Gray Values** — one entry per persistent item, each with
+  the matching tool icon. **Double-click** (or right-click → **Go To**) an entry
+  to jump back to where it was created; right-click → **Remove** to delete it.
+
 ### Histogram & windowing
 - Live histogram whose bars are shaded by their mapped gray value (black below
   the window minimum, white above the maximum).
@@ -53,14 +65,23 @@ forward/backward-compatibility checks.
 ### Measurements (2D viewports)
 - Dropdown tool with **Distance**, **Angle**, and **Diameter**, with live values
   in millimetres (computed from the voxel size). Yellow, draggable, with grab
-  handles; they pan/zoom with the image and clear on slice/alignment changes.
+  handles; they pan/zoom with the image.
+- **Persistent**: each measurement remembers its viewport, slice, and the
+  alignment it was created in, and is listed under **Measurements** in the
+  Project Structure. It hides when you leave its slice and reappears when you
+  return; **double-click its entry** to navigate straight back to it (activating
+  its alignment if needed). It is saved with the project.
 
 ### Gray-value tools (2D viewports)
 - **Gray Value Picker** — a draggable crosshair showing live X/Y/Z coordinates
   and the gray value (shown as a plain integer for integer datasets).
 - **Gray Value Profile** — a draggable line with a live intensity plot drawn
-  above it (with Y-axis tick labels). **Right-click** the profile to export the
-  samples to **CSV**.
+  above it (with Y-axis tick labels).
+- Like measurements, gray-value tools are **persistent and alignment-aware**:
+  each is listed under **Gray Values** in the Project Structure, hides off its
+  slice, navigates back on double-click, and is saved with the project. Export a
+  profile's samples to **CSV** by right-clicking its entry in the Project
+  Structure → **Export to CSV…**.
 
 ### 3D view
 - **Isosurface** (marching cubes, with an isovalue slider) and **Phong Volume**
@@ -82,16 +103,26 @@ forward/backward-compatibility checks.
   preview.
 - **Operations → Alignment → 3-2-1 Alignment…** — pick a plane, a line, and an
   origin to align to the standard frame.
+- **Alignment history** in the Project Structure: importing a volume creates an
+  **Initial Alignment** (the raw CT scan frame); each applied Simple/3-2-1
+  alignment adds a new entry, and the most recently applied one is **(active)**.
+  Double-click an entry — or right-click → **Activate** — to switch to it; the
+  Initial Alignment is always present and can be activated but not removed.
+  Right-click any other → **Remove**; if measurements or gray-value tools were
+  created in that alignment, you're warned that they'll be removed with it.
+- The active alignment is applied at display time only (the voxel data is never
+  modified) and is **pre-resampled once** so panning/scrolling stays fast.
 
 ### Import / projects
 - **File → Import → Import Slice Files…** (TIFF or raw) and **Import Volume…**
   (TIFF or single raw volume), with a metadata dialog for raw data (dimensions,
   voxel size, data type, byte order / endianness, Z flip). Large imports show a
   progress bar.
-- **File → Open / Save Voxels Project…** — saves the source reference, window,
-  viewport state, alignment, lock state, render mode, and camera to a `.voxels`
-  file. The title bar shows the current project name (or **New Project** until it
-  is saved), and closing the app prompts to **save unsaved changes**
+- **File → Open / Save Voxels Project…** — saves the source reference, volume
+  name, window, viewport state, the full alignment history (and which is active),
+  all measurements and gray-value tools, lock state, render mode, and camera to a
+  `.voxels` file. The title bar shows the current project name (or **New Project**
+  until it is saved), and closing the app prompts to **save unsaved changes**
   (**Yes / No / Cancel**) when there are any.
 - **Operations → Volume Information…** — a read-only histogram plus a table of
   voxel dimensions, physical dimensions, voxel size, data type, and volume size.

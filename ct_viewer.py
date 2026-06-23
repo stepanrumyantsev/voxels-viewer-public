@@ -167,7 +167,7 @@ APP_NAME = 'Voxels Viewer'
 # and forms the full version (YY.M.build) used in the About dialog and saved
 # into .voxels project files for compatibility checks.
 APP_VERSION = '26.6'          # June 2026
-APP_BUILD = 38
+APP_BUILD = 59
 APP_VERSION_FULL = f'{APP_VERSION}.{APP_BUILD}'
 
 
@@ -333,7 +333,9 @@ def _save_prefs(prefs: dict) -> None:
 
 _LICENSE_HTML = """
 <h2 style="margin-bottom:4px;">Voxels Viewer</h2>
-<p style="color:gray;">Copyright &copy; 2026 Stepan Rumyantsev. All rights reserved.</p>
+<p style="color:gray;">Copyright &copy; 2026 Stepan Rumyantsev. All rights reserved.<br>
+Web Site: <a href="https://stepanrumyantsev.com">https://stepanrumyantsev.com</a><br>
+Source Code: <a href="https://github.com/stepanrumyantsev/voxels-viewer-public">https://github.com/stepanrumyantsev/voxels-viewer-public</a></p>
 
 <h3>License</h3>
 <p>
@@ -463,6 +465,9 @@ class AboutDialog(QDialog):
         license_browser = QTextBrowser()
         license_browser.setHtml(_LICENSE_HTML)
         license_browser.setOpenLinks(False)
+        license_browser.anchorClicked.connect(
+            lambda url: QtGui.QDesktopServices.openUrl(url)
+        )
         tabs.addTab(license_browser, 'License')
 
         third_party_browser = QTextBrowser()
@@ -777,6 +782,290 @@ class RangeSlider(QWidget):
         for hx in (xlow, xhigh):
             p.drawEllipse(QtCore.QPointF(hx, gy), r, r)
         p.end()
+
+
+def _make_voxel_icon(color, size=32):
+    """A square cut into a 3x3 grid — the 'voxels' glyph for the Volume node."""
+    px = QtGui.QPixmap(size, size)
+    px.fill(Qt.transparent)
+    p = QtGui.QPainter(px)
+    pen = QtGui.QPen(QtGui.QColor(color))
+    pen.setWidth(2)
+    pen.setJoinStyle(Qt.MiterJoin)
+    p.setPen(pen)
+    m = 4
+    s = size - 2 * m
+    p.drawRect(m, m, s, s)
+    for i in (1, 2):
+        off = round(i * s / 3)
+        p.drawLine(m + off, m, m + off, m + s)
+        p.drawLine(m, m + off, m + s, m + off)
+    p.end()
+    return QtGui.QIcon(px)
+
+
+def _make_folder_icon(color, size=32):
+    """A simple outlined folder glyph, matching the line aesthetic of the
+    voxel icon (so the tree icons stay monochrome and theme-aware)."""
+    px = QtGui.QPixmap(size, size)
+    px.fill(Qt.transparent)
+    p = QtGui.QPainter(px)
+    p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    pen = QtGui.QPen(QtGui.QColor(color))
+    pen.setWidth(2)
+    pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    m = 4
+    w = size - 2 * m
+    h = w * 0.74
+    top = (size - h) / 2.0
+    tab_w = w * 0.42
+    tab_h = h * 0.20
+    path = QtGui.QPainterPath()
+    path.moveTo(m, top + tab_h)
+    path.lineTo(m, top)
+    path.lineTo(m + tab_w, top)
+    path.lineTo(m + tab_w + tab_h, top + tab_h)
+    path.lineTo(m + w, top + tab_h)
+    path.lineTo(m + w, top + h)
+    path.lineTo(m, top + h)
+    path.closeSubpath()
+    p.drawPath(path)
+    p.end()
+    return QtGui.QIcon(px)
+
+
+class ProjectStructureWidget(QWidget):
+    """Hierarchical project tree shown above the histogram in the sidebar.
+
+        Volume                (renamable, voxel icon)
+          ├─ Alignments
+          ├─ Measurements
+          └─ Gray Values
+
+    The folders are placeholders for now (expandable but empty). Right-clicking
+    the Volume offers Properties (→ Volume Information) and Rename.
+    """
+    properties_requested = Signal()
+    volume_renamed = Signal(str)
+    alignment_activate_requested = Signal(int)
+    alignment_remove_requested = Signal(int)
+    measurement_activate_requested = Signal(int)
+    measurement_remove_requested = Signal(int)
+    grayvalue_activate_requested = Signal(int)
+    grayvalue_remove_requested = Signal(int)
+    grayvalue_export_requested = Signal(int)
+
+    FOLDERS = ('Alignments', 'Measurements', 'Gray Values')
+
+    # Custom item-data roles (offset from UserRole).
+    _ROLE_KIND = Qt.UserRole          # 'volume' | 'folder' | 'alignment'
+    _ROLE_INDEX = Qt.UserRole + 1     # alignment index in MainWindow's list
+    _ROLE_INITIAL = Qt.UserRole + 2   # True for the non-removable Initial Alignment
+    _ROLE_SUBKIND = Qt.UserRole + 3   # tool sub-kind (e.g. 'profile' gray value)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._icon_color = QtGui.QColor('#6e6e6e')   # neutral gray (light theme)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        title = QLabel('Project')
+        title.setStyleSheet('font-weight: bold; padding: 2px 4px;')
+        layout.addWidget(title)
+
+        self.tree = QtWidgets.QTreeWidget()
+        self.tree.setHeaderHidden(True)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._on_context_menu)
+        # Single click never edits; F2 (on the editable Volume item) and the
+        # context-menu Rename are the explicit rename paths.
+        self.tree.setEditTriggers(QtWidgets.QAbstractItemView.EditKeyPressed)
+        # Small, uniform icons so the tool glyphs sit neatly beside the entries.
+        self.tree.setIconSize(QtCore.QSize(14, 14))
+        layout.addWidget(self.tree)
+
+        self._build_tree()
+        self.tree.itemChanged.connect(self._on_item_changed)
+        self.tree.itemDoubleClicked.connect(self._on_item_double_clicked)
+
+    def _build_tree(self):
+        self.volume_item = QtWidgets.QTreeWidgetItem(self.tree, ['Volume'])
+        self.volume_item.setIcon(0, _make_voxel_icon(self._icon_color))
+        self.volume_item.setData(0, self._ROLE_KIND, 'volume')
+        self.volume_item.setFlags(self.volume_item.flags() | Qt.ItemIsEditable)
+
+        folder_icon = _make_folder_icon(self._icon_color)
+        self.folder_items = {}
+        for name in self.FOLDERS:
+            child = QtWidgets.QTreeWidgetItem(self.volume_item, [name])
+            child.setIcon(0, folder_icon)
+            child.setData(0, self._ROLE_KIND, 'folder')
+            # Folders are not renamable (no ItemIsEditable flag).
+            self.folder_items[name] = child
+        self.alignment_items = []
+        self.measurement_items = []
+        self.grayvalue_items = []
+        self.volume_item.setExpanded(True)
+
+    def set_alignments(self, entries, active_index):
+        """Rebuild the Alignments folder.
+
+        ``entries`` is a list of {'name': str, 'initial': bool}; the entry at
+        ``active_index`` is shown with a ' (active)' suffix."""
+        folder = self.folder_items['Alignments']
+        folder.takeChildren()
+        self.alignment_items = []
+        tripod = _axes_tripod_icon(self._icon_color)
+        for i, e in enumerate(entries):
+            label = e['name'] + (' (active)' if i == active_index else '')
+            item = QtWidgets.QTreeWidgetItem(folder, [label])
+            item.setData(0, self._ROLE_KIND, 'alignment')
+            item.setData(0, self._ROLE_INDEX, i)
+            item.setData(0, self._ROLE_INITIAL, bool(e.get('initial')))
+            item.setIcon(0, tripod)
+            self.alignment_items.append(item)
+        if entries:
+            folder.setExpanded(True)
+
+    def set_measurements(self, entries):
+        """Rebuild the Measurements folder. ``entries`` is a list of
+        {'name': str}; index in the list is the measurement's id."""
+        folder = self.folder_items['Measurements']
+        folder.takeChildren()
+        self.measurement_items = []
+        for i, e in enumerate(entries):
+            item = QtWidgets.QTreeWidgetItem(folder, [e['name']])
+            item.setData(0, self._ROLE_KIND, 'measurement')
+            item.setData(0, self._ROLE_INDEX, i)
+            kind = e.get('kind')
+            item.setData(0, self._ROLE_SUBKIND, kind)
+            if kind:
+                item.setIcon(0, _measure_icon(kind, self._icon_color))
+            self.measurement_items.append(item)
+        if entries:
+            folder.setExpanded(True)
+
+    def set_gray_values(self, entries):
+        """Rebuild the Gray Values folder. ``entries`` is a list of
+        {'name': str}; index in the list is the gray-value's id."""
+        folder = self.folder_items['Gray Values']
+        folder.takeChildren()
+        self.grayvalue_items = []
+        for i, e in enumerate(entries):
+            item = QtWidgets.QTreeWidgetItem(folder, [e['name']])
+            item.setData(0, self._ROLE_KIND, 'grayvalue')
+            item.setData(0, self._ROLE_INDEX, i)
+            kind = e.get('kind')
+            item.setData(0, self._ROLE_SUBKIND, kind)
+            if kind:
+                item.setIcon(0, _grayvalue_icon(kind, self._icon_color))
+            self.grayvalue_items.append(item)
+        if entries:
+            folder.setExpanded(True)
+
+    def set_volume_name(self, name):
+        """Set the Volume node's text without emitting volume_renamed."""
+        self.tree.blockSignals(True)
+        self.volume_item.setText(0, name or 'Volume')
+        self.tree.blockSignals(False)
+
+    def volume_name(self):
+        return self.volume_item.text(0)
+
+    def _on_context_menu(self, pos):
+        item = self.tree.itemAt(pos)
+        if item is None:
+            return
+        kind = item.data(0, self._ROLE_KIND)
+        if kind == 'volume':
+            menu = QtWidgets.QMenu(self)
+            rename_action = menu.addAction('Rename')
+            props_action = menu.addAction('Properties...')
+            chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
+            if chosen == props_action:
+                self.properties_requested.emit()
+            elif chosen == rename_action:
+                self.tree.editItem(item, 0)
+        elif kind == 'alignment':
+            idx = int(item.data(0, self._ROLE_INDEX))
+            is_initial = bool(item.data(0, self._ROLE_INITIAL))
+            menu = QtWidgets.QMenu(self)
+            activate_action = menu.addAction('Activate')
+            # Initial Alignment is activatable but never removable.
+            remove_action = None if is_initial else menu.addAction('Remove')
+            chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
+            if chosen == activate_action:
+                self.alignment_activate_requested.emit(idx)
+            elif remove_action is not None and chosen == remove_action:
+                self.alignment_remove_requested.emit(idx)
+        elif kind == 'measurement':
+            idx = int(item.data(0, self._ROLE_INDEX))
+            menu = QtWidgets.QMenu(self)
+            goto_action = menu.addAction('Go To')
+            remove_action = menu.addAction('Remove')
+            chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
+            if chosen == goto_action:
+                self.measurement_activate_requested.emit(idx)
+            elif chosen == remove_action:
+                self.measurement_remove_requested.emit(idx)
+        elif kind == 'grayvalue':
+            idx = int(item.data(0, self._ROLE_INDEX))
+            menu = QtWidgets.QMenu(self)
+            goto_action = menu.addAction('Go To')
+            # Only the profile tool produces a sampled curve to export.
+            export_action = (menu.addAction('Export to CSV...')
+                             if item.data(0, self._ROLE_SUBKIND) == 'profile'
+                             else None)
+            remove_action = menu.addAction('Remove')
+            chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
+            if chosen == goto_action:
+                self.grayvalue_activate_requested.emit(idx)
+            elif export_action is not None and chosen == export_action:
+                self.grayvalue_export_requested.emit(idx)
+            elif chosen == remove_action:
+                self.grayvalue_remove_requested.emit(idx)
+
+    def _on_item_double_clicked(self, item, _col):
+        if item is None:
+            return
+        kind = item.data(0, self._ROLE_KIND)
+        if kind == 'alignment':
+            self.alignment_activate_requested.emit(int(item.data(0, self._ROLE_INDEX)))
+        elif kind == 'measurement':
+            self.measurement_activate_requested.emit(int(item.data(0, self._ROLE_INDEX)))
+        elif kind == 'grayvalue':
+            self.grayvalue_activate_requested.emit(int(item.data(0, self._ROLE_INDEX)))
+
+    def _on_item_changed(self, item, _col):
+        if item is self.volume_item:
+            name = (item.text(0) or '').strip()
+            if not name:
+                name = 'Volume'
+                self.set_volume_name(name)
+            self.volume_renamed.emit(name)
+
+    def apply_theme(self, dark):
+        self._icon_color = QtGui.QColor('#b0b0b0' if dark else '#6e6e6e')
+        self.tree.blockSignals(True)
+        self.volume_item.setIcon(0, _make_voxel_icon(self._icon_color))
+        folder_icon = _make_folder_icon(self._icon_color)
+        for child in self.folder_items.values():
+            child.setIcon(0, folder_icon)
+        # Re-tint the per-entry tool icons to match the new theme.
+        tripod = _axes_tripod_icon(self._icon_color)
+        for item in self.alignment_items:
+            item.setIcon(0, tripod)
+        for item in self.measurement_items:
+            kind = item.data(0, self._ROLE_SUBKIND)
+            if kind:
+                item.setIcon(0, _measure_icon(kind, self._icon_color))
+        for item in self.grayvalue_items:
+            kind = item.data(0, self._ROLE_SUBKIND)
+            if kind:
+                item.setIcon(0, _grayvalue_icon(kind, self._icon_color))
+        self.tree.blockSignals(False)
 
 
 class BrightnessCurveWidget(QWidget):
@@ -1257,9 +1546,10 @@ def _lock_icon(locked: bool) -> QtGui.QIcon:
     return icon
 
 
-def _measure_icon(kind: str) -> QtGui.QIcon:
+def _measure_icon(kind: str, color: str = '#cccccc') -> QtGui.QIcon:
     """Monochrome symbolic icon for a measurement tool, drawn at 1× and 2×
-    into a 20×20 logical-pixel canvas (matches the lock-icon style)."""
+    into a 20×20 logical-pixel canvas (matches the lock-icon style). ``color``
+    defaults to the viewport-toolbar gray; the project tree passes a themed gray."""
     icon = QtGui.QIcon()
     for dpr in (1.0, 2.0):
         S_phys = round(20 * dpr)
@@ -1271,7 +1561,7 @@ def _measure_icon(kind: str) -> QtGui.QIcon:
         p.setRenderHint(QtGui.QPainter.Antialiasing)
         p.scale(S_phys / 20.0, S_phys / 20.0)
 
-        col = QtGui.QColor('#cccccc')
+        col = QtGui.QColor(color)
         pen = QtGui.QPen(col, 1.6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
         p.setPen(pen)
         p.setBrush(Qt.NoBrush)
@@ -1390,10 +1680,17 @@ class _BaseMeasurement:
         self.update()
 
     def _handle_view_points(self):
+        # Map each handle from ROI-local coords straight to the viewbox (data)
+        # coordinate system via the ROI's own transform. This deliberately
+        # avoids the scene→view round-trip (getSceneHandlePositions +
+        # mapSceneToView), which depends on the live view/scene transform and
+        # returns wrong (devicePixelRatio-scaled) values on Retina displays
+        # before layout settles — that corrupted captured geometry, making a
+        # measurement's value jump ~2× when it was restored.
         pts = []
-        for _name, sp in self.roi.getSceneHandlePositions():
-            vp = self.vb.mapSceneToView(sp)
-            pts.append(np.array([vp.x(), vp.y()], dtype=float))
+        for _name, lp in self.roi.getLocalHandlePositions():
+            pp = self.roi.mapToParent(lp)
+            pts.append(np.array([pp.x(), pp.y()], dtype=float))
         return pts
 
     def update(self):
@@ -1428,6 +1725,13 @@ class _DistanceMeasurement(_BaseMeasurement):
         self.label.setText(f'{d:.2f} mm')
         self.label.setPos(float(mid[0]), float(mid[1]))
 
+    def geometry(self):
+        pts = self._handle_view_points()
+        if len(pts) < 2:
+            return [[0.0, 0.0], [0.0, 0.0]]
+        return [[float(pts[0][0]), float(pts[0][1])],
+                [float(pts[1][0]), float(pts[1][1])]]
+
 
 class _AngleMeasurement(_BaseMeasurement):
     def __init__(self, viewer, a, b, c):
@@ -1458,6 +1762,12 @@ class _AngleMeasurement(_BaseMeasurement):
         self.label.setText(f'{ang:.1f}°')
         self.label.setPos(float(b[0]), float(b[1]))
 
+    def geometry(self):
+        pts = self._handle_view_points()
+        if len(pts) < 3:
+            return [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]]
+        return [[float(p[0]), float(p[1])] for p in pts[:3]]
+
 
 class _DiameterMeasurement(_BaseMeasurement):
     def __init__(self, viewer, cx, cy, r):
@@ -1481,9 +1791,16 @@ class _DiameterMeasurement(_BaseMeasurement):
         self.label.setText(f'Ø {d:.2f} mm')
         self.label.setPos(cx, cy)
 
+    def geometry(self):
+        size = self.roi.size()
+        pos = self.roi.pos()
+        r = float(size[0]) / 2.0
+        return [float(pos[0]) + r, float(pos[1]) + r, r]
 
-def _grayvalue_icon(kind: str) -> QtGui.QIcon:
-    """Monochrome symbolic icon for a gray-value tool (picker / profile)."""
+
+def _grayvalue_icon(kind: str, color: str = '#cccccc') -> QtGui.QIcon:
+    """Monochrome symbolic icon for a gray-value tool (picker / profile).
+    ``color`` defaults to the viewport-toolbar gray; the tree passes a themed gray."""
     icon = QtGui.QIcon()
     for dpr in (1.0, 2.0):
         S_phys = round(20 * dpr)
@@ -1493,7 +1810,7 @@ def _grayvalue_icon(kind: str) -> QtGui.QIcon:
         p = QtGui.QPainter(px)
         p.setRenderHint(QtGui.QPainter.Antialiasing)
         p.scale(S_phys / 20.0, S_phys / 20.0)
-        pen = QtGui.QPen(QtGui.QColor('#cccccc'), 1.6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        pen = QtGui.QPen(QtGui.QColor(color), 1.6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
         p.setPen(pen)
         p.setBrush(Qt.NoBrush)
         if kind == 'picker':
@@ -1512,6 +1829,29 @@ def _grayvalue_icon(kind: str) -> QtGui.QIcon:
         p.end()
         icon.addPixmap(px)
     return icon
+
+
+def _axes_tripod_icon(color: str = '#cccccc', width: float = 1.6) -> QtGui.QIcon:
+    """Coordinate tripod — three lines (X/Y/Z axes) from a common origin. Used
+    as the alignment symbol in the project tree and the Operations menu.
+
+    Drawn as a single high-resolution pixmap (Qt down-scales it cleanly to any
+    icon size). A multi-resolution / devicePixelRatio icon was tried first but
+    rendered as a single line at larger sizes (e.g. in the menu)."""
+    S = 64
+    px = QtGui.QPixmap(S, S)
+    px.fill(Qt.transparent)
+    p = QtGui.QPainter(px)
+    p.setRenderHint(QtGui.QPainter.Antialiasing)
+    p.scale(S / 20.0, S / 20.0)
+    pen = QtGui.QPen(QtGui.QColor(color), width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+    p.setPen(pen)
+    ox, oy = 9.0, 11.0                              # common origin
+    p.drawLine(QtCore.QLineF(ox, oy, ox, 2.5))      # Z — straight up
+    p.drawLine(QtCore.QLineF(ox, oy, 18.0, oy))     # X — to the right
+    p.drawLine(QtCore.QLineF(ox, oy, 2.5, 18.0))    # Y — diagonal, down-left
+    p.end()
+    return QtGui.QIcon(px)
 
 
 def _clip_icon(state: str) -> QtGui.QIcon:
@@ -1596,6 +1936,13 @@ class _GrayValuePicker:
         self.label.setText(f'X {x}  Y {y}  Z {z}\nGV {self.viewer.gray_format(val)}')
         self.label.setPos(float(pos.x()), float(pos.y()))
 
+    def geometry(self):
+        pos = self.target.pos()
+        return [float(pos.x()), float(pos.y())]
+
+    def changed_signal(self):
+        return self.target.sigPositionChanged
+
     def remove(self):
         for item in (self.target, self.label):
             try:
@@ -1631,22 +1978,31 @@ class _GrayValueProfile:
         for lbl in self.tick_labels:
             self.view.addItem(lbl, ignoreBounds=True)
 
-        # Right-click the line (or curve) exports the profile to CSV.
-        self._orig_roi_click = self.roi.mouseClickEvent
-        self.roi.mouseClickEvent = self._on_line_click
-        self.curve.setClickable(True, width=8)
-        self.curve.mouseClickEvent = self._on_curve_click
-
+        # CSV export is offered from the Project Structure tree (right-click the
+        # profile entry), not from the 2D viewport.
         self.roi.sigRegionChanged.connect(self.update)
         self._profile = None    # (distance_mm, values, px, py) for export
         self.update()
 
     def _endpoints(self):
+        # Use the ROI's own transform (not the scene→view round-trip) so the
+        # endpoints are independent of zoom/pan/devicePixelRatio/layout timing —
+        # see _BaseMeasurement._handle_view_points for the Retina rationale.
         pts = []
-        for _n, sp in self.roi.getSceneHandlePositions():
-            vp = self.vb.mapSceneToView(sp)
-            pts.append(np.array([vp.x(), vp.y()], dtype=float))
+        for _n, lp in self.roi.getLocalHandlePositions():
+            pp = self.roi.mapToParent(lp)
+            pts.append(np.array([pp.x(), pp.y()], dtype=float))
         return pts
+
+    def geometry(self):
+        pts = self._endpoints()
+        if len(pts) < 2:
+            return [[0.0, 0.0], [0.0, 0.0]]
+        return [[float(pts[0][0]), float(pts[0][1])],
+                [float(pts[1][0]), float(pts[1][1])]]
+
+    def changed_signal(self):
+        return self.roi.sigRegionChanged
 
     def update(self):
         pts = self._endpoints()
@@ -1709,20 +2065,10 @@ class _GrayValueProfile:
             self.tick_labels[i].setPos(float(tip[0]), float(tip[1]))
         self.axis.setData(ax_x, ax_y, connect='finite')
 
-    def _on_line_click(self, ev):
-        if ev.button() == Qt.RightButton:
-            ev.accept()
-            self._export_csv()
-        else:
-            self._orig_roi_click(ev)
-
-    def _on_curve_click(self, ev):
-        if ev.button() == Qt.RightButton:
-            ev.accept()
-            self._export_csv()
-
-    def _export_csv(self):
+    def export_csv(self):
         if self._profile is None:
+            QMessageBox.warning(self.viewer, 'Export Gray Value Profile',
+                                'No profile samples available to export.')
             return
         dist_mm, vals, px, py = self._profile
         path, _ = QFileDialog.getSaveFileName(
@@ -1755,6 +2101,8 @@ class SliceViewer(QWidget):
     axis_position_changed = Signal(str, int, int)  # (axis, index, total)
     lock_clicked = Signal()
     measurement_tool_changed = Signal(str)         # user picked a tool from the menu
+    measurement_created = Signal(object)           # a new measurement graphic was made
+    gray_value_created = Signal(object)            # a new gray-value graphic was made
     clip_changed = Signal()                        # clipping-plane toggle changed
     planes_toggled = Signal(bool)                  # coordinate-planes visibility toggle
 
@@ -1788,6 +2136,7 @@ class SliceViewer(QWidget):
         self._perm_R      = None      # permanent non-destructive alignment transform
         self._perm_offset = None
         self._perm_shape  = None      # output bounding-box shape for the permanent transform
+        self._aligned_vol = None      # full pre-resampled aligned volume (fast slicing)
         self._axis_lines  = {}   # axis -> pg.InfiniteLine
         self._axis_timers = {}   # axis -> QTimer
         self._lines_pinned = False
@@ -2079,11 +2428,42 @@ class SliceViewer(QWidget):
             m = _DiameterMeasurement(self, cx, cy, 0.125 * w)
         else:
             return
+        m.kind = kind
+        m._record = None
         self._measurements.append(m)
+        # The owning MainWindow registers a persistent record for this graphic.
+        self.measurement_created.emit(m)
+
+    def build_measurement(self, kind, points):
+        """Recreate a measurement graphic from stored geometry (used when a
+        persistent measurement scrolls back into its slice). Returns the graphic
+        or None. Does NOT emit measurement_created."""
+        if self.volume_data is None or self.volume_data.volume is None:
+            return None
+        if kind == 'distance':
+            p1, p2 = points
+            m = _DistanceMeasurement(self, list(p1), list(p2))
+        elif kind == 'angle':
+            a, b, c = points
+            m = _AngleMeasurement(self, list(a), list(b), list(c))
+        elif kind == 'diameter':
+            cx, cy, r = points
+            m = _DiameterMeasurement(self, float(cx), float(cy), float(r))
+        else:
+            return None
+        m.kind = kind
+        m._record = None
+        self._measurements.append(m)
+        return m
 
     def clear_measurements(self):
+        """Remove the currently-displayed measurement graphics from this view.
+        Persistent records (owned by MainWindow) are detached, not deleted."""
         for m in self._measurements:
             m.remove()
+            rec = getattr(m, '_record', None)
+            if rec is not None:
+                rec['graphic'] = None
         self._measurements = []
 
     # ── Gray-value tools ──────────────────────────────────────────────────
@@ -2112,11 +2492,36 @@ class SliceViewer(QWidget):
             obj = _GrayValueProfile(self, [cx - half, cy], [cx + half, cy])
         else:
             return
+        obj.kind = kind
+        obj._record = None
         self._gray_items.append(obj)
+        self.gray_value_created.emit(obj)
+
+    def build_gray_value(self, kind, points):
+        """Recreate a gray-value graphic from stored geometry. Returns the
+        object or None. Does NOT emit gray_value_created."""
+        if self.volume_data is None or self.volume_data.volume is None:
+            return None
+        if kind == 'picker':
+            x, y = points
+            obj = _GrayValuePicker(self, float(x), float(y))
+        elif kind == 'profile':
+            p1, p2 = points
+            obj = _GrayValueProfile(self, list(p1), list(p2))
+        else:
+            return None
+        obj.kind = kind
+        obj._record = None
+        self._gray_items.append(obj)
+        return obj
 
     def clear_gray_values(self):
+        """Remove displayed gray-value graphics; detach persistent records."""
         for g in self._gray_items:
             g.remove()
+            rec = getattr(g, '_record', None)
+            if rec is not None:
+                rec['graphic'] = None
         self._gray_items = []
 
     # ── Clipping plane ────────────────────────────────────────────────────
@@ -2315,6 +2720,7 @@ class SliceViewer(QWidget):
         self._perm_R = None
         self._perm_offset = None
         self._perm_shape = None
+        self._aligned_vol = None
         self.clear_measurements()
         self.clear_gray_values()
         if self._clip_state != 'off':
@@ -2369,15 +2775,23 @@ class SliceViewer(QWidget):
         self.clear_gray_values()
         self.update_image()
 
-    def set_permanent_transform(self, R, offset, out_shape):
+    def set_permanent_transform(self, R, offset, out_shape, aligned_vol=None):
         """Set a persistent non-destructive alignment transform (survives preview cycles).
 
         ``out_shape`` is the bounding-box shape of the aligned output frame; the
         viewer samples / scrolls over this frame rather than the raw volume.
+
+        ``aligned_vol`` (optional) is the full volume already resampled into the
+        output frame. When provided, update_image() slices it directly — as fast
+        as the raw path — instead of resampling each slice on demand. It is shared
+        (read-only) across the three viewers, so panning/scrolling stays smooth
+        after an alignment. When None (e.g. a very large frame), the viewer falls
+        back to per-slice sampling.
         """
         self._perm_R      = np.array(R,      dtype=np.float64)
         self._perm_offset = np.array(offset, dtype=np.float64)
         self._perm_shape  = tuple(int(s) for s in out_shape)
+        self._aligned_vol = aligned_vol
         self.clear_measurements()
         self.clear_gray_values()
         self._auto_range_pending = True
@@ -2388,6 +2802,7 @@ class SliceViewer(QWidget):
         self._perm_R      = None
         self._perm_offset = None
         self._perm_shape  = None
+        self._aligned_vol = None
         self.clear_measurements()
         self.clear_gray_values()
         self._auto_range_pending = True
@@ -2441,6 +2856,32 @@ class SliceViewer(QWidget):
 
     def update_image(self):
         if self.volume_data is None or self.volume_data.volume is None:
+            return
+        # Fast path for an applied alignment: the whole volume was pre-resampled
+        # into the aligned output frame once, so a slice is a cheap numpy view —
+        # identical pixels to per-slice sampling, but pan/scroll stay smooth.
+        # (Live preview still uses on-the-fly sampling; it has no cached volume.)
+        if (self._preview_R is None and self._perm_R is not None
+                and self._aligned_vol is not None):
+            av = self._aligned_vol
+            ax = {'XY': 2, 'YZ': 0, 'XZ': 1}[self.orientation]
+            idx = int(np.clip(self.current_index, 0, av.shape[ax] - 1))
+            if self.orientation == 'XY':
+                image = av[:, ::-1, idx]
+            elif self.orientation == 'YZ':
+                image = av[idx, :, ::-1]
+            else:                                  # XZ
+                image = av[:, idx, ::-1]
+            ar = self._auto_range_pending
+            self._auto_range_pending = False
+            if self._display_levels is not None:
+                self.image_view.setImage(image, autoLevels=False,
+                                         autoRange=ar, levels=self._display_levels)
+            else:
+                self.image_view.setImage(image, autoLevels=True, autoRange=ar)
+            self.image_view.getImageItem().setRect(
+                QtCore.QRectF(0, 0, image.shape[0], image.shape[1]))
+            self.image_view.getView().setAspectLocked(True)
             return
         # Temporary preview overrides permanent transform; permanent overrides raw slice.
         R_use = off_use = vol_use = shape_use = None
@@ -2544,30 +2985,36 @@ class SliceViewer(QWidget):
             return
 
         color = _AXIS_LINE_COLORS[axis]
-        pen_dash  = pg.mkPen(color=color, width=1, style=Qt.DashLine)
-        pen_solid = pg.mkPen(color=color, width=2, style=Qt.SolidLine)
-
-        # Remove any existing items for this axis before redrawing.
         view = self.image_view.getView()
-        if axis in self._axis_lines:
-            for item in self._axis_lines[axis]:
-                view.removeItem(item)
-
-        # Always use InfiniteLine for the dashed full extent — it never
-        # influences ViewBox auto-range, so the image scale is preserved.
-        items = [pg.InfiniteLine(pos=pos, angle=angle, pen=pen_dash)]
-
+        # Reuse persistent line items per axis and just reposition them, rather
+        # than recreating graphics items on every call. Recreation (addItem /
+        # removeItem / signal connect-disconnect) churns the scene graph and was
+        # a major cost during pan and locked slice-sync, especially after an
+        # alignment. The dashed InfiniteLine never affects ViewBox auto-range.
+        entry = self._axis_lines.get(axis)
+        if entry is None:
+            line = pg.InfiniteLine(
+                pos=pos, angle=angle,
+                pen=pg.mkPen(color=color, width=1, style=Qt.DashLine))
+            seg = pg.PlotDataItem(
+                pen=pg.mkPen(color=color, width=2, style=Qt.SolidLine))
+            view.addItem(line, ignoreBounds=True)
+            view.addItem(seg, ignoreBounds=True)
+            entry = {'line': line, 'seg': seg}
+            self._axis_lines[axis] = entry
+        line, seg = entry['line'], entry['seg']
+        line.setAngle(angle)
+        line.setValue(pos)
+        line.setVisible(True)
         if seg_range is not None:
             a, b = min(seg_range), max(seg_range)
             if angle == 0:  # horizontal at y=pos
-                seg_item = pg.PlotDataItem([a, b], [pos, pos], pen=pen_solid)
+                seg.setData([a, b], [pos, pos])
             else:           # vertical at x=pos
-                seg_item = pg.PlotDataItem([pos, pos], [a, b], pen=pen_solid)
-            items.append(seg_item)
-
-        for item in items:
-            view.addItem(item, ignoreBounds=True)
-        self._axis_lines[axis] = items
+                seg.setData([pos, pos], [a, b])
+            seg.setVisible(True)
+        else:
+            seg.setVisible(False)
 
         if self._lines_pinned:
             # Pinned mode: stop any running hide timer; line stays until unpinned.
@@ -2584,10 +3031,10 @@ class SliceViewer(QWidget):
     def hide_axis_line(self, axis):
         if self._lines_pinned:
             return
-        if axis in self._axis_lines:
-            view = self.image_view.getView()
-            for item in self._axis_lines.pop(axis):
-                view.removeItem(item)
+        entry = self._axis_lines.get(axis)
+        if entry is not None:   # keep the items for reuse; just hide them
+            entry['line'].setVisible(False)
+            entry['seg'].setVisible(False)
         if axis in self._axis_timers:
             self._axis_timers.pop(axis).stop()
 
@@ -2604,9 +3051,9 @@ class SliceViewer(QWidget):
             timer.stop()
         self._axis_timers.clear()
         view = self.image_view.getView()
-        for items in list(self._axis_lines.values()):
-            for item in items:
-                view.removeItem(item)
+        for entry in list(self._axis_lines.values()):
+            view.removeItem(entry['line'])
+            view.removeItem(entry['seg'])
         self._axis_lines.clear()
 
     def set_coord_lines_enabled(self, enabled):
@@ -4128,8 +4575,16 @@ class MainWindow(QMainWindow):
         self._plane_hide_timer = QtCore.QTimer(self)
         self._plane_hide_timer.setSingleShot(True)
         self._plane_hide_timer.timeout.connect(self._on_plane_hide_timeout)
+        # Throttle the locked-mode viewport sync (re-slicing/re-centering the
+        # other viewports) so a fast pan drag stays smooth — see
+        # _on_viewport_range_changed.
+        self._lock_sync_timer = QtCore.QTimer(self)
+        self._lock_sync_timer.setSingleShot(True)
+        self._lock_sync_timer.timeout.connect(self._do_lock_sync)
+        self._pending_lock_source = None
         self._project_source = None
         self._project_path = None    # saved .voxels path; None ⇒ unsaved "New Project"
+        self._volume_name = 'Volume' # name shown for the Volume node in the tree
         self._dirty = False          # unsaved changes to an opened project
         self._loading = False        # suppress dirty-marking during project restore
         # Single cumulative view-time alignment (output→input, scipy convention
@@ -4139,6 +4594,25 @@ class MainWindow(QMainWindow):
         self._align_R      = np.eye(3, dtype=np.float64)
         self._align_offset = np.zeros(3, dtype=np.float64)
         self._align_shape  = None   # output bounding-box shape (current display frame)
+        self._aligned_cache = None  # whole volume pre-resampled into the active frame
+        self._aligned_key   = None  # transform key the cache was built for
+        # Alignment history shown under the project tree's Alignments folder.
+        # Index 0 is always the non-removable "Initial Alignment" (the raw CT
+        # scan frame). Each applied Simple/3-2-1 alignment appends a record
+        # holding its absolute input→display transform; one is always active.
+        self._alignments = []
+        self._active_alignment = 0
+        self._align_counters = {'simple': 0, '321': 0}
+        # Persistent measurements (project tree "Measurements"). Each record is a
+        # dict with kind/orientation/slice/alignment/points/view_range/graphic;
+        # the graphic exists only while the measurement is on its visible slice.
+        self._measurements = []
+        self._meas_counter = {'distance': 0, 'angle': 0, 'diameter': 0}
+        # Persistent gray-value tools (project tree "Gray Values"). Same model
+        # as measurements: each record carries kind/orientation/slice/alignment/
+        # points/view_range/graphic.
+        self._gray_values = []
+        self._gray_counter = {'picker': 0, 'profile': 0}
         self.setup_ui()
         self.create_menu()
         self._apply_theme()
@@ -4173,6 +4647,38 @@ class MainWindow(QMainWindow):
         """Flag unsaved changes (ignored while a project is being restored)."""
         if not self._loading:
             self._dirty = True
+
+    # ── Volume (project tree) name ────────────────────────────────────────────
+    def _set_volume_name(self, name):
+        """Set the Volume node name in state and in the tree (no dirty flag)."""
+        self._volume_name = name or 'Volume'
+        self.project_tree.set_volume_name(self._volume_name)
+
+    def _on_volume_renamed(self, name):
+        """User renamed the Volume node in the tree."""
+        self._volume_name = name or 'Volume'
+        self._mark_dirty()
+
+    @staticmethod
+    def _derive_volume_name(paths):
+        """Smart Volume name from imported file(s); fall back to 'Volume'.
+
+        A single file → its stem. A stack of slices/projections differs only by
+        an index, so use the file-name part common to all of them (prefix or
+        suffix), trimmed of separators and the varying digits.
+        """
+        stems = [os.path.splitext(os.path.basename(p))[0] for p in paths if p]
+        if not stems:
+            return 'Volume'
+        if len(stems) == 1:
+            return stems[0] or 'Volume'
+        prefix = os.path.commonprefix(stems)
+        suffix = os.path.commonprefix([s[::-1] for s in stems])[::-1]
+        trim = ' _-.0123456789'
+        prefix = prefix.strip(trim)
+        suffix = suffix.strip(trim)
+        candidate = prefix if len(prefix) >= len(suffix) else suffix
+        return candidate or 'Volume'
 
     def _start_new_project(self):
         """Reset to an unsaved 'New Project' (e.g. after a fresh import)."""
@@ -4211,6 +4717,28 @@ class MainWindow(QMainWindow):
         self.left_panel.setMaximumWidth(420)
         self.left_panel.curve_changed.connect(self.on_curve_changed)
 
+        # Project Structure tree above the histogram, sharing the sidebar 50/50.
+        self.project_tree = ProjectStructureWidget(self)
+        self.project_tree.properties_requested.connect(self.open_volume_information)
+        self.project_tree.volume_renamed.connect(self._on_volume_renamed)
+        self.project_tree.alignment_activate_requested.connect(self._activate_alignment)
+        self.project_tree.alignment_remove_requested.connect(self._remove_alignment)
+        self.project_tree.measurement_activate_requested.connect(self._goto_measurement)
+        self.project_tree.measurement_remove_requested.connect(self._remove_measurement)
+        self.project_tree.grayvalue_activate_requested.connect(self._goto_gray_value)
+        self.project_tree.grayvalue_remove_requested.connect(self._remove_gray_value)
+        self.project_tree.grayvalue_export_requested.connect(self._export_gray_value)
+        self.project_tree.set_volume_name(self._volume_name)
+
+        self.left_splitter = QtWidgets.QSplitter(Qt.Vertical)
+        self.left_splitter.addWidget(self.project_tree)
+        self.left_splitter.addWidget(self.left_panel)
+        self.left_splitter.setSizes([400, 400])   # 50% each
+        self.left_splitter.setStretchFactor(0, 1)
+        self.left_splitter.setStretchFactor(1, 1)
+        self.left_splitter.setMinimumWidth(200)
+        self.left_splitter.setMaximumWidth(420)
+
         grid_widget = QWidget()
         grid_widget.setMinimumWidth(800)
         grid_layout = QGridLayout(grid_widget)
@@ -4234,7 +4762,7 @@ class MainWindow(QMainWindow):
         grid_layout.setColumnStretch(1, 1)
 
         self.splitter = QtWidgets.QSplitter(Qt.Horizontal)
-        self.splitter.addWidget(self.left_panel)
+        self.splitter.addWidget(self.left_splitter)
         self.splitter.addWidget(grid_widget)
         self.splitter.setSizes([220, 1200])
         self.splitter.setStretchFactor(0, 0)
@@ -4253,6 +4781,14 @@ class MainWindow(QMainWindow):
         self.view_yz.point_placed.connect(self.on_point_placed)
         self.view_xz.point_placed.connect(self.on_point_placed)
         self.view_3d.point_placed.connect(self.on_point_placed)
+
+        # Register a persistent record whenever a viewer creates a measurement
+        # or a gray-value tool.
+        for sv in (self.view_xy, self.view_yz, self.view_xz):
+            sv.measurement_created.connect(
+                lambda m, sv=sv: self._on_measurement_created(sv, m))
+            sv.gray_value_created.connect(
+                lambda g, sv=sv: self._on_gray_value_created(sv, g))
 
         # 3D render mode / isovalue changes count as project changes.
         self.view_3d.mode_combo.currentTextChanged.connect(lambda *_: self._mark_dirty())
@@ -4361,6 +4897,12 @@ class MainWindow(QMainWindow):
 
         operations_menu = menubar.addMenu('&Operations')
         alignment_menu = operations_menu.addMenu('Alignment')
+        # Tripod icon on the Alignment submenu. Render it as a template/mask so
+        # macOS tints it to the menu text colour (full contrast on light/dark),
+        # with a thicker stroke so all three axes read at menu size.
+        menu_tripod = _axes_tripod_icon('#000000', width=2.4)
+        menu_tripod.setIsMask(True)
+        alignment_menu.setIcon(menu_tripod)
         simple_align = QtWidgets.QAction('Simple Alignment...', self)
         simple_align.triggered.connect(self.open_simple_alignment)
         point_align = QtWidgets.QAction('3-2-1 Alignment...', self)
@@ -4603,6 +5145,10 @@ class MainWindow(QMainWindow):
                 'type': 'tiff_slices', 'files': [os.path.basename(p) for p in paths],
                 'voxel_size': list(voxels), 'dtype': str(np.dtype(dtype)),
             }
+        self._set_volume_name(self._derive_volume_name(paths))
+        self._reset_alignments()
+        self._reset_measurements()
+        self._reset_gray_values()
         self.update_views()
         self._start_new_project()
 
@@ -4648,6 +5194,10 @@ class MainWindow(QMainWindow):
                 'type': 'tiff_volume', 'file': os.path.basename(path),
                 'voxel_size': list(voxels), 'dtype': str(np.dtype(dtype)),
             }
+        self._set_volume_name(self._derive_volume_name([path]))
+        self._reset_alignments()
+        self._reset_measurements()
+        self._reset_gray_values()
         self.update_views()
         self._start_new_project()
 
@@ -4714,6 +5264,7 @@ class MainWindow(QMainWindow):
             'version': 1,
             'app_version': APP_VERSION_FULL,
             'source': self._project_source,
+            'volume_name': self._volume_name,
             'viewports': {
                 'xy': vp_state(self.view_xy),
                 'yz': vp_state(self.view_yz),
@@ -4725,6 +5276,10 @@ class MainWindow(QMainWindow):
                 'scale': self.preferences.get('histogram_scale', 'Logarithmic'),
             },
             'alignment': align,
+            'alignments': [self._serialize_alignment(a) for a in self._alignments],
+            'active_alignment': self._active_alignment,
+            'measurements': [self._serialize_measurement(r) for r in self._measurements],
+            'gray_values': [self._serialize_gray_value(r) for r in self._gray_values],
             'sync_locked': self._sync_locked,
             'render': {
                 'mode': self.view_3d.mode,
@@ -4797,6 +5352,7 @@ class MainWindow(QMainWindow):
         self._loading = True   # suppress dirty-marking while restoring state
         self.volume_data.set_volume(volume, tuple(voxels))
         self._project_source = project['source']
+        self._set_volume_name(project.get('volume_name', 'Volume'))
         self._save_import_dir(path)
 
         # Restore the alignment as a view-time transform (no resample). Handles
@@ -4804,6 +5360,9 @@ class MainWindow(QMainWindow):
         # the legacy non-destructive dict. update_views() pushes it to the views.
         self._reset_alignment_state()
         self._restore_alignment(project.get('alignment'))
+        self._restore_alignments(project)
+        self._restore_measurements(project)
+        self._restore_gray_values(project)
 
         self.update_views()
 
@@ -5095,6 +5654,10 @@ class MainWindow(QMainWindow):
         if isinstance(self.maximized_widget, SliceViewer) and \
                 self.maximized_widget._pip is self.pip_3d:
             self._show_pip_for(self.maximized_widget)
+        # Re-display the persistent measurements / gray-value tools that belong
+        # on the current slices / active alignment (volume/alignment may change).
+        self._sync_measurements()
+        self._sync_gray()
 
     def on_curve_changed(self, curve):
         if not self.volume_data.is_loaded() or len(curve) < 4:
@@ -5129,6 +5692,7 @@ class MainWindow(QMainWindow):
             app.setPalette(app.style().standardPalette())
         self.left_panel.apply_theme(dark)
         self.left_panel.set_histogram_scale(self.preferences.get('histogram_scale', 'Logarithmic') == 'Logarithmic')
+        self.project_tree.apply_theme(dark)
 
     def open_volume_information(self):
         if not self.volume_data.is_loaded():
@@ -5200,6 +5764,7 @@ class MainWindow(QMainWindow):
         # dialog's (R, offset) is the pre-bounding-box scipy offset.
         R_b, off_b, out_shape = _alignment_bbox(R, offset, orig.shape)
         self._set_view_alignment(R_b, off_b, out_shape)
+        self._record_alignment('simple')
 
     def _on_simple_cancelled(self):
         self._simple_align_dialog = None
@@ -5232,7 +5797,16 @@ class MainWindow(QMainWindow):
         return None
 
     def _on_axis_position_changed(self, source_viewer, axis, index, total):
+        # While a locked-mode sync is running, the slice images are updated by
+        # on_slice_changed directly; skip the per-slice overlay/measurement
+        # cascade here — _do_lock_sync does one consolidated update instead.
+        if self._syncing:
+            return
         self._mark_dirty()
+        # The moving viewport changed slice: re-display the persistent
+        # measurements / gray-value tools on the new slice (hide the others).
+        self._sync_measurements_for(source_viewer)
+        self._sync_gray_for(source_viewer)
         # A slice move updates any active clipping plane + the 3D coord planes.
         # In unlocked mode, only the moving viewport's plane is shown in 3D, and
         # it auto-hides after the same timeout as the 2D coordinate lines.
@@ -5401,40 +5975,80 @@ class MainWindow(QMainWindow):
                 viewer.show_axis_line(axis, index, total, seg)
 
     def _on_viewport_range_changed(self, source_viewer):
-        self._mark_dirty()
-        # Zoom/pan in one viewport surfaces this viewport's coordinate line in
-        # the others (and refreshes its solid segment). Always show — in
-        # unlocked mode this triggers their appearance and the auto-hide timer;
-        # in locked mode the lines are pinned, so this just keeps segments live.
-        vol_shape = self._display_shape()
-        if vol_shape is not None:
-            axis   = {'XY': 'Z', 'YZ': 'X', 'XZ': 'Y'}[source_viewer.orientation]
-            ax_idx = {'XY': 2, 'YZ': 0, 'XZ': 1}[source_viewer.orientation]
-            src_range = source_viewer.image_view.getView().getViewBox().viewRange()
-            for viewer in self._slice_viewers():
-                seg = self._compute_seg_range(source_viewer.orientation, src_range,
-                                              viewer.orientation, vol_shape)
-                viewer.show_axis_line(axis, source_viewer.current_index,
-                                     vol_shape[ax_idx], seg)
-            # The 3D coordinate plane resizes/shifts with this viewport's zoom &
-            # pan. Unlocked: surface its plane and (re)start the auto-hide timer.
-            if not self._sync_locked:
-                self._active_plane_axis = ax_idx
-                self._plane_hide_timer.start(3000)
-            self._update_coord_planes()
-
-        # Propagate zoom/pan to all viewports when locked (centered on intersection).
-        if not self._sync_locked or self._syncing:
+        # Re-entrant range changes (from _center_all_on_intersection during a
+        # sync) are ignored — _do_lock_sync handles everything in one pass.
+        if self._syncing:
             return
-        self._syncing = True
+        self._mark_dirty()
+        if self._sync_locked:
+            # Locked: re-slicing + re-centering the other viewports is the costly
+            # part and a pan drag fires far more events than the display can use.
+            # Defer ALL cross-viewport work to a throttled tick (~30 Hz): run once
+            # immediately (leading edge) and once after the drag settles, so the
+            # panned viewport itself stays fully responsive in between.
+            self._pending_lock_source = source_viewer
+            if not self._lock_sync_timer.isActive():
+                self._do_lock_sync()
+                self._lock_sync_timer.start(33)
+            return
+        # Unlocked: light per-event overlays only (no slice sync). Surface this
+        # viewport's coordinate line in the others + (re)start the auto-hide.
+        self._update_range_overlays(source_viewer, restart_hide=True)
+
+    def _update_range_overlays(self, source_viewer, restart_hide=False):
+        """Show this viewport's coordinate line across the viewports and refresh
+        the 3D coordinate planes (the cheap per-pan overlay work)."""
+        vol_shape = self._display_shape()
+        if vol_shape is None:
+            return
+        axis   = {'XY': 'Z', 'YZ': 'X', 'XZ': 'Y'}[source_viewer.orientation]
+        ax_idx = {'XY': 2, 'YZ': 0, 'XZ': 1}[source_viewer.orientation]
         src_range = source_viewer.image_view.getView().getViewBox().viewRange()
-        xr, yr = src_range
-        W, H = xr[1] - xr[0], yr[1] - yr[0]
+        for viewer in self._slice_viewers():
+            seg = self._compute_seg_range(source_viewer.orientation, src_range,
+                                          viewer.orientation, vol_shape)
+            viewer.show_axis_line(axis, source_viewer.current_index,
+                                  vol_shape[ax_idx], seg)
+        if restart_hide and not self._sync_locked:
+            self._active_plane_axis = ax_idx
+            self._plane_hide_timer.start(3000)
+        self._update_coord_planes()
+
+    def _do_lock_sync(self):
+        """Re-slice/re-center the other viewports to the pan source's center, then
+        refresh overlays ONCE (throttled entry — see _on_viewport_range_changed).
+
+        While ``_syncing`` is set, the slice/range cascades triggered below are
+        short-circuited in their handlers, so all the overlay, clip, coordinate-
+        line and measurement work happens exactly once here per tick."""
+        sv = self._pending_lock_source
+        if sv is None or not self._sync_locked or self._syncing:
+            return
+        before = (self.view_xy.current_index, self.view_yz.current_index,
+                  self.view_xz.current_index)
+        self._syncing = True
         try:
-            self._sync_slices_to_center(source_viewer, src_range)
+            src_range = sv.image_view.getView().getViewBox().viewRange()
+            xr, yr = src_range
+            W, H = xr[1] - xr[0], yr[1] - yr[0]
+            self._sync_slices_to_center(sv, src_range)
             self._center_all_on_intersection(W, H)
         finally:
             self._syncing = False
+        # Overlays whose extent tracks the view (cheap) refresh every tick.
+        self._show_all_coord_lines()
+        self._update_coord_planes()
+        if isinstance(self.maximized_widget, SliceViewer):
+            self._update_pip_plane()
+        # Slice-dependent work (clips, measurements, gray-value tools) only when a
+        # slice actually changed. Pure pan/zoom that doesn't cross a slice must
+        # NOT rebuild these — rebuilding the ROI graphics every tick made pan and
+        # zoom sluggish whenever the project had measurements/gray-value tools.
+        if (self.view_xy.current_index, self.view_yz.current_index,
+                self.view_xz.current_index) != before:
+            self._update_clips()
+            self._sync_measurements()
+            self._sync_gray()
 
     def _center_all_on_intersection(self, W, H):
         """Set every locked viewport's range to W×H centered on its own line intersection.
@@ -5569,6 +6183,425 @@ class MainWindow(QMainWindow):
         R, origin = result_transform
         self._apply_321(R, origin)
 
+    # ── Alignment history (project tree) ──────────────────────────────────────
+    def _reset_alignments(self):
+        """Start a fresh history with just the Initial Alignment (active)."""
+        self._alignments = [{
+            'name': 'Initial Alignment', 'kind': 'initial',
+            'R': None, 'offset': None, 'out_shape': None,
+        }]
+        self._active_alignment = 0
+        self._align_counters = {'simple': 0, '321': 0}
+        self._refresh_alignment_tree()
+
+    def _refresh_alignment_tree(self):
+        entries = [{'name': a['name'], 'initial': a['kind'] == 'initial'}
+                   for a in self._alignments]
+        self.project_tree.set_alignments(entries, self._active_alignment)
+
+    def _record_alignment(self, kind):
+        """Snapshot the just-applied cumulative transform as a new history entry
+        and make it the active one."""
+        labels = {'simple': 'Simple Alignment', '321': '3-2-1 Alignment'}
+        self._align_counters[kind] = self._align_counters.get(kind, 0) + 1
+        rec = {
+            'name': f"{labels.get(kind, 'Alignment')} {self._align_counters[kind]}",
+            'kind': kind,
+            'R': self._align_R.copy(),
+            'offset': self._align_offset.copy(),
+            'out_shape': tuple(int(s) for s in self._align_shape),
+        }
+        self._alignments.append(rec)
+        self._active_alignment = len(self._alignments) - 1
+        self._refresh_alignment_tree()
+        self._sync_measurements()
+        self._sync_gray()
+
+    def _show_raw_alignment(self):
+        """Drop the view-time alignment and show the raw (Initial) volume."""
+        self._reset_alignment_state()
+        for sv in self._slice_viewers():
+            sv.clear_permanent_transform()
+        self.view_3d.clear_permanent_volume()
+        self.update_views()
+
+    def _activate_alignment(self, index):
+        """Make the history entry at ``index`` the active alignment."""
+        if index < 0 or index >= len(self._alignments):
+            return
+        rec = self._alignments[index]
+        self._active_alignment = index
+        if rec['kind'] == 'initial':
+            self._show_raw_alignment()
+        else:
+            self._set_view_alignment(rec['R'], rec['offset'], rec['out_shape'])
+        self._mark_dirty()
+        self._refresh_alignment_tree()
+        self._sync_measurements()
+        self._sync_gray()
+
+    def _remove_alignment(self, index):
+        """Delete a non-initial history entry; re-activate a neighbour if it was
+        the active one. Measurements and gray-value tools created in this
+        alignment are dependent and are removed with it (after confirmation)."""
+        if index <= 0 or index >= len(self._alignments):
+            return  # index 0 (Initial) is never removable
+        dep_meas = [r for r in self._measurements if r['alignment'] == index]
+        dep_gray = [r for r in self._gray_values if r['alignment'] == index]
+        n_dep = len(dep_meas) + len(dep_gray)
+        if n_dep:
+            parts = []
+            if dep_meas:
+                parts.append(f"{len(dep_meas)} measurement(s)")
+            if dep_gray:
+                parts.append(f"{len(dep_gray)} gray-value tool(s)")
+            ans = QMessageBox.warning(
+                self, 'Remove Alignment',
+                f"{' and '.join(parts)} were created in "
+                f"“{self._alignments[index]['name']}” and will also be "
+                f"removed.\n\nRemove the alignment and its dependent items?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ans != QMessageBox.Yes:
+                return
+        was_active = (index == self._active_alignment)
+        # Drop dependent measurements / gray values (and any live graphics).
+        for rec in dep_meas:
+            if rec.get('graphic') is not None:
+                rec['graphic'].remove()
+            self._measurements.remove(rec)
+        for rec in dep_gray:
+            if rec.get('graphic') is not None:
+                rec['graphic'].remove()
+            self._gray_values.remove(rec)
+        # Shift alignment indices on the survivors.
+        for rec in self._measurements + self._gray_values:
+            if rec['alignment'] > index:
+                rec['alignment'] -= 1
+        del self._alignments[index]
+        if was_active:
+            self._activate_alignment(index - 1)   # fall back to the previous entry
+        else:
+            if self._active_alignment > index:
+                self._active_alignment -= 1
+            self._mark_dirty()
+            self._refresh_alignment_tree()
+            self._sync_measurements()
+            self._sync_gray()
+        self._refresh_measurement_tree()
+        self._refresh_gray_tree()
+
+    def _serialize_alignment(self, a):
+        return {
+            'name': a['name'], 'kind': a['kind'],
+            'R': a['R'].tolist() if a['R'] is not None else None,
+            'offset': a['offset'].tolist() if a['offset'] is not None else None,
+            'out_shape': list(a['out_shape']) if a['out_shape'] is not None else None,
+        }
+
+    def _restore_alignments(self, project):
+        """Rebuild the alignment history from an opened project (or reconstruct a
+        minimal history for legacy files that stored only the active transform)."""
+        saved = project.get('alignments')
+        if saved:
+            self._alignments = []
+            for a in saved:
+                self._alignments.append({
+                    'name': a.get('name', 'Alignment'),
+                    'kind': a.get('kind', 'simple'),
+                    'R': np.array(a['R'], dtype=np.float64) if a.get('R') is not None else None,
+                    'offset': np.array(a['offset'], dtype=np.float64) if a.get('offset') is not None else None,
+                    'out_shape': tuple(a['out_shape']) if a.get('out_shape') is not None else None,
+                })
+            self._active_alignment = int(project.get('active_alignment', 0))
+            self._align_counters = {'simple': 0, '321': 0}
+            for a in self._alignments:
+                if a['kind'] in self._align_counters:
+                    self._align_counters[a['kind']] += 1
+        else:
+            self._alignments = [{
+                'name': 'Initial Alignment', 'kind': 'initial',
+                'R': None, 'offset': None, 'out_shape': None,
+            }]
+            self._align_counters = {'simple': 0, '321': 0}
+            if self._align_active:
+                self._align_counters['simple'] = 1
+                self._alignments.append({
+                    'name': 'Restored Alignment', 'kind': 'simple',
+                    'R': self._align_R.copy(), 'offset': self._align_offset.copy(),
+                    'out_shape': tuple(int(s) for s in self._align_shape),
+                })
+                self._active_alignment = 1
+            else:
+                self._active_alignment = 0
+        self._refresh_alignment_tree()
+
+    # ── Measurements (project tree) ───────────────────────────────────────────
+    def _viewer_for_orientation(self, orientation):
+        return {'XY': self.view_xy, 'YZ': self.view_yz,
+                'XZ': self.view_xz}.get(orientation)
+
+    def _reset_measurements(self):
+        for rec in self._measurements:
+            if rec.get('graphic') is not None:
+                rec['graphic'].remove()
+        self._measurements = []
+        self._meas_counter = {'distance': 0, 'angle': 0, 'diameter': 0}
+        self._refresh_measurement_tree()
+
+    def _refresh_measurement_tree(self):
+        self.project_tree.set_measurements(
+            [{'name': r['name'], 'kind': r['kind']} for r in self._measurements])
+
+    def _on_measurement_created(self, viewer, m):
+        """A viewer just made a new measurement graphic — register a persistent
+        record for it (tagged with the current slice and active alignment)."""
+        kind = getattr(m, 'kind', 'distance')
+        label = {'distance': 'Distance', 'angle': 'Angle',
+                 'diameter': 'Diameter'}.get(kind, 'Measurement')
+        self._meas_counter[kind] = self._meas_counter.get(kind, 0) + 1
+        vr = viewer.image_view.getView().getViewBox().viewRange()
+        rec = {
+            'name': f'{label} {self._meas_counter[kind]}',
+            'kind': kind,
+            'orientation': viewer.orientation,
+            'slice': viewer.current_index,
+            'alignment': self._active_alignment,
+            'points': m.geometry(),
+            'view_range': [list(vr[0]), list(vr[1])],
+            'graphic': m,
+        }
+        m._record = rec
+        self._measurements.append(rec)
+        self._connect_measurement_drag(m, rec)
+        self._refresh_measurement_tree()
+        self._mark_dirty()
+
+    def _connect_measurement_drag(self, m, rec):
+        """Keep the record's geometry in step with interactive drags."""
+        def _sync_geom():
+            rec['points'] = m.geometry()
+            self._mark_dirty()
+        m.roi.sigRegionChanged.connect(_sync_geom)
+
+    def _spawn_measurement_graphic(self, viewer, rec):
+        m = viewer.build_measurement(rec['kind'], rec['points'])
+        if m is None:
+            return
+        m._record = rec
+        rec['graphic'] = m
+        self._connect_measurement_drag(m, rec)
+
+    def _sync_measurements_for(self, viewer):
+        """Show exactly the measurements that belong on this viewer's current
+        slice + active alignment; hide (but keep) the rest."""
+        viewer.clear_measurements()
+        if not self.volume_data.is_loaded():
+            return
+        if getattr(self, '_simple_align_dialog', None) is not None:
+            return   # don't show measurements during an alignment preview
+        for rec in self._measurements:
+            if rec['orientation'] != viewer.orientation:
+                continue
+            if rec['alignment'] != self._active_alignment:
+                continue
+            if viewer.current_index != rec['slice']:
+                continue
+            self._spawn_measurement_graphic(viewer, rec)
+
+    def _sync_measurements(self):
+        for sv in self._slice_viewers():
+            self._sync_measurements_for(sv)
+
+    def _goto_measurement(self, index):
+        """Navigate back to where a measurement was created (activating its
+        alignment and slice) so it becomes visible again."""
+        if index < 0 or index >= len(self._measurements):
+            return
+        rec = self._measurements[index]
+        if rec['alignment'] != self._active_alignment:
+            self._activate_alignment(rec['alignment'])
+        viewer = self._viewer_for_orientation(rec['orientation'])
+        if viewer is None:
+            return
+        # Setting the slider drives on_slice_changed → measurement re-sync. If the
+        # slice is already current, sync explicitly below.
+        viewer.slice_slider.setValue(int(rec['slice']))
+        vr = rec.get('view_range')
+        if vr is not None:
+            viewer.image_view.getView().getViewBox().setRange(
+                xRange=vr[0], yRange=vr[1], padding=0)
+        self._sync_measurements_for(viewer)
+
+    def _remove_measurement(self, index):
+        if index < 0 or index >= len(self._measurements):
+            return
+        rec = self._measurements.pop(index)
+        if rec.get('graphic') is not None:
+            rec['graphic'].remove()
+        self._refresh_measurement_tree()
+        self._mark_dirty()
+
+    def _serialize_measurement(self, r):
+        return {
+            'name': r['name'], 'kind': r['kind'],
+            'orientation': r['orientation'], 'slice': int(r['slice']),
+            'alignment': int(r['alignment']), 'points': r['points'],
+            'view_range': r.get('view_range'),
+        }
+
+    def _restore_measurements(self, project):
+        self._measurements = []
+        self._meas_counter = {'distance': 0, 'angle': 0, 'diameter': 0}
+        for mr in project.get('measurements', []) or []:
+            kind = mr.get('kind', 'distance')
+            self._measurements.append({
+                'name': mr.get('name', 'Measurement'), 'kind': kind,
+                'orientation': mr.get('orientation', 'XY'),
+                'slice': int(mr.get('slice', 0)),
+                'alignment': int(mr.get('alignment', 0)),
+                'points': mr.get('points'),
+                'view_range': mr.get('view_range'),
+                'graphic': None,
+            })
+            if kind in self._meas_counter:
+                self._meas_counter[kind] += 1
+        self._refresh_measurement_tree()
+
+    # ── Gray-value tools (project tree) ───────────────────────────────────────
+    def _reset_gray_values(self):
+        for rec in self._gray_values:
+            if rec.get('graphic') is not None:
+                rec['graphic'].remove()
+        self._gray_values = []
+        self._gray_counter = {'picker': 0, 'profile': 0}
+        self._refresh_gray_tree()
+
+    def _refresh_gray_tree(self):
+        self.project_tree.set_gray_values(
+            [{'name': r['name'], 'kind': r['kind']} for r in self._gray_values])
+
+    def _on_gray_value_created(self, viewer, g):
+        kind = getattr(g, 'kind', 'picker')
+        label = {'picker': 'Picker', 'profile': 'Profile'}.get(kind, 'Gray Value')
+        self._gray_counter[kind] = self._gray_counter.get(kind, 0) + 1
+        vr = viewer.image_view.getView().getViewBox().viewRange()
+        rec = {
+            'name': f'{label} {self._gray_counter[kind]}',
+            'kind': kind,
+            'orientation': viewer.orientation,
+            'slice': viewer.current_index,
+            'alignment': self._active_alignment,
+            'points': g.geometry(),
+            'view_range': [list(vr[0]), list(vr[1])],
+            'graphic': g,
+        }
+        g._record = rec
+        self._gray_values.append(rec)
+        self._connect_gray_drag(g, rec)
+        self._refresh_gray_tree()
+        self._mark_dirty()
+
+    def _connect_gray_drag(self, g, rec):
+        def _sync_geom():
+            rec['points'] = g.geometry()
+            self._mark_dirty()
+        g.changed_signal().connect(_sync_geom)
+
+    def _spawn_gray_graphic(self, viewer, rec):
+        g = viewer.build_gray_value(rec['kind'], rec['points'])
+        if g is None:
+            return
+        g._record = rec
+        rec['graphic'] = g
+        self._connect_gray_drag(g, rec)
+
+    def _sync_gray_for(self, viewer):
+        viewer.clear_gray_values()
+        if not self.volume_data.is_loaded():
+            return
+        if getattr(self, '_simple_align_dialog', None) is not None:
+            return
+        for rec in self._gray_values:
+            if rec['orientation'] != viewer.orientation:
+                continue
+            if rec['alignment'] != self._active_alignment:
+                continue
+            if viewer.current_index != rec['slice']:
+                continue
+            self._spawn_gray_graphic(viewer, rec)
+
+    def _sync_gray(self):
+        for sv in self._slice_viewers():
+            self._sync_gray_for(sv)
+
+    def _goto_gray_value(self, index):
+        if index < 0 or index >= len(self._gray_values):
+            return
+        rec = self._gray_values[index]
+        if rec['alignment'] != self._active_alignment:
+            self._activate_alignment(rec['alignment'])
+        viewer = self._viewer_for_orientation(rec['orientation'])
+        if viewer is None:
+            return
+        viewer.slice_slider.setValue(int(rec['slice']))
+        vr = rec.get('view_range')
+        if vr is not None:
+            viewer.image_view.getView().getViewBox().setRange(
+                xRange=vr[0], yRange=vr[1], padding=0)
+        self._sync_gray_for(viewer)
+
+    def _remove_gray_value(self, index):
+        if index < 0 or index >= len(self._gray_values):
+            return
+        rec = self._gray_values.pop(index)
+        if rec.get('graphic') is not None:
+            rec['graphic'].remove()
+        self._refresh_gray_tree()
+        self._mark_dirty()
+
+    def _export_gray_value(self, index):
+        """Export a gray-value Profile's samples to CSV (moved here from the
+        2D viewport right-click). Navigates to the profile first so its samples
+        are freshly computed, then exports from the live graphic."""
+        if index < 0 or index >= len(self._gray_values):
+            return
+        rec = self._gray_values[index]
+        if rec['kind'] != 'profile':
+            return
+        self._goto_gray_value(index)   # ensure it's on-screen and sampled
+        g = rec.get('graphic')
+        if g is None or not hasattr(g, 'export_csv'):
+            QMessageBox.warning(self, 'Export Gray Value Profile',
+                                'Could not access the profile data.')
+            return
+        g.export_csv()
+
+    def _serialize_gray_value(self, r):
+        return {
+            'name': r['name'], 'kind': r['kind'],
+            'orientation': r['orientation'], 'slice': int(r['slice']),
+            'alignment': int(r['alignment']), 'points': r['points'],
+            'view_range': r.get('view_range'),
+        }
+
+    def _restore_gray_values(self, project):
+        self._gray_values = []
+        self._gray_counter = {'picker': 0, 'profile': 0}
+        for gr in project.get('gray_values', []) or []:
+            kind = gr.get('kind', 'picker')
+            self._gray_values.append({
+                'name': gr.get('name', 'Gray Value'), 'kind': kind,
+                'orientation': gr.get('orientation', 'XY'),
+                'slice': int(gr.get('slice', 0)),
+                'alignment': int(gr.get('alignment', 0)),
+                'points': gr.get('points'),
+                'view_range': gr.get('view_range'),
+                'graphic': None,
+            })
+            if kind in self._gray_counter:
+                self._gray_counter[kind] += 1
+        self._refresh_gray_tree()
+
     # ── View-time alignment state ────────────────────────────────────────────
     def _reset_alignment_state(self):
         """Reset the cumulative alignment to identity for the loaded volume.
@@ -5578,6 +6611,7 @@ class MainWindow(QMainWindow):
         self._align_active = False
         self._align_R      = np.eye(3, dtype=np.float64)
         self._align_offset = np.zeros(3, dtype=np.float64)
+        self._aligned_cache = self._aligned_key = None   # free any cached frame
         if self.volume_data is not None and self.volume_data.volume is not None:
             self._align_shape = self.volume_data.volume.shape
         else:
@@ -5624,6 +6658,36 @@ class MainWindow(QMainWindow):
         self._align_offset = np.asarray(offset, dtype=np.float64)
         self._align_shape  = tuple(int(s) for s in out_shape)
 
+    # Pre-resample the whole aligned volume into a shared cache when the output
+    # frame is at most this many float32 bytes (~1.5 GB). Above this we fall back
+    # to per-slice sampling so huge volumes don't blow up memory.
+    _MAX_ALIGNED_CACHE_BYTES = 1_500_000_000
+
+    def _aligned_volume_cache(self, R, offset, out_shape):
+        """Full volume resampled into the aligned output frame (float32), cached
+        and reused while the transform is unchanged. Returns None if scipy is
+        missing or the frame is too large (caller then samples per slice)."""
+        key = (R.tobytes(), offset.tobytes(), tuple(out_shape))
+        if self._aligned_key == key and self._aligned_cache is not None:
+            return self._aligned_cache
+        vol = self.volume_data.volume
+        if vol is None or _scipy_affine_transform is None:
+            self._aligned_cache = self._aligned_key = None
+            return None
+        if int(np.prod(out_shape)) * 4 > self._MAX_ALIGNED_CACHE_BYTES:
+            self._aligned_cache = self._aligned_key = None
+            return None
+        try:
+            aligned = _scipy_affine_transform(
+                vol, R, offset=offset, output_shape=tuple(out_shape),
+                order=1, mode='constant', cval=0.0, output=np.float32)
+        except Exception:
+            self._aligned_cache = self._aligned_key = None
+            return None
+        self._aligned_cache = aligned
+        self._aligned_key = key
+        return aligned
+
     def _set_view_alignment(self, R, offset, out_shape):
         """Make (R, offset, out_shape) the active cumulative alignment and push it
         to every viewport as a non-destructive, view-time transform."""
@@ -5632,8 +6696,13 @@ class MainWindow(QMainWindow):
         self._align_R      = np.asarray(R,      dtype=np.float64)
         self._align_offset = np.asarray(offset, dtype=np.float64)
         self._align_shape  = tuple(int(s) for s in out_shape)
+        # Resample the whole aligned volume once (shared by all viewers) so 2D
+        # pan/scroll stays fast; viewers fall back to per-slice sampling if None.
+        aligned = self._aligned_volume_cache(self._align_R, self._align_offset,
+                                             self._align_shape)
         for sv in self._slice_viewers():
-            sv.set_permanent_transform(self._align_R, self._align_offset, self._align_shape)
+            sv.set_permanent_transform(self._align_R, self._align_offset,
+                                       self._align_shape, aligned)
         self._apply_alignment_to_3d(self._align_R, self._align_offset)
 
     def _apply_new_alignment(self, R2, offset0, title):
@@ -5654,17 +6723,18 @@ class MainWindow(QMainWindow):
         # Compose under the existing display→input transform.
         R, offset = _compose_alignment(self._align_R, self._align_offset, R2, off2)
         self._set_view_alignment(R, offset, out_shape)
+        self._record_alignment('321')
 
     def reset_alignment(self):
-        """User action: drop the view-time alignment and show the raw volume."""
+        """User action: drop the view-time alignment and show the raw volume
+        (i.e. re-activate the Initial Alignment)."""
         if not self.volume_data.is_loaded():
             return
-        self._mark_dirty()
-        self._reset_alignment_state()
-        for sv in self._slice_viewers():
-            sv.clear_permanent_transform()
-        self.view_3d.clear_permanent_volume()
-        self.update_views()
+        if self._alignments:
+            self._activate_alignment(0)
+        else:
+            self._mark_dirty()
+            self._show_raw_alignment()
 
     def _apply_321(self, R, origin_pt):
         # Points were picked in the currently displayed frame; origin_pt is the
