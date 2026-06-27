@@ -167,7 +167,7 @@ APP_NAME = 'Voxels Viewer'
 # and forms the full version (YY.M.build) used in the About dialog and saved
 # into .voxels project files for compatibility checks.
 APP_VERSION = '26.6'          # June 2026
-APP_BUILD = 59
+APP_BUILD = 101
 APP_VERSION_FULL = f'{APP_VERSION}.{APP_BUILD}'
 
 
@@ -659,6 +659,8 @@ class RangeSlider(QWidget):
         self._high = 10000
         self._handle_radius = 7
         self._drag = None          # 'low', 'high', or None
+        self._last = 'high'        # which handle was touched last
+        self._span_color = None    # optional override for the selected-span colour
         self.setMinimumHeight(24)
         self.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
                            QtWidgets.QSizePolicy.Fixed)
@@ -677,6 +679,18 @@ class RangeSlider(QWidget):
 
     def high(self):
         return self._high
+
+    def setSpanColor(self, color):
+        """Override the colour of the selected span + handles (None = default)."""
+        self._span_color = color
+        self.update()
+
+    def last_handle(self):
+        """'low' or 'high' — whichever handle was moved most recently."""
+        return self._last
+
+    def last_value(self):
+        return self._low if self._last == 'low' else self._high
 
     def setLow(self, value):
         value = int(max(self._minimum, min(value, self._high)))
@@ -747,8 +761,10 @@ class RangeSlider(QWidget):
     def _move_to(self, x):
         value = self._x_to_value(x)
         if self._drag == 'low':
+            self._last = 'low'
             self.setLow(value)
         elif self._drag == 'high':
+            self._last = 'high'
             self.setHigh(value)
 
     # ── Painting ──────────────────────────────────────────────────────────
@@ -769,8 +785,12 @@ class RangeSlider(QWidget):
         p.drawRoundedRect(QtCore.QRectF(lo_x, gy - 2, hi_x - lo_x, 4), 2, 2)
 
         # selected span between the two handles
-        span_col = (pal.color(QtGui.QPalette.Highlight) if enabled
-                    else pal.color(QtGui.QPalette.Mid))
+        if enabled and self._span_color is not None:
+            span_col = QtGui.QColor(self._span_color)
+        elif enabled:
+            span_col = pal.color(QtGui.QPalette.Highlight)
+        else:
+            span_col = pal.color(QtGui.QPalette.Mid)
         p.setBrush(span_col)
         p.drawRoundedRect(QtCore.QRectF(xlow, gy - 2, xhigh - xlow, 4), 2, 2)
 
@@ -835,6 +855,27 @@ def _make_folder_icon(color, size=32):
     return QtGui.QIcon(px)
 
 
+def _triangle_icon(color, size=32):
+    """An outlined triangle — the surface-mesh glyph for the project tree."""
+    px = QtGui.QPixmap(size, size)
+    px.fill(Qt.transparent)
+    p = QtGui.QPainter(px)
+    p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    pen = QtGui.QPen(QtGui.QColor(color))
+    pen.setWidth(2)
+    pen.setJoinStyle(Qt.RoundJoin)
+    p.setPen(pen)
+    m = 4.5
+    path = QtGui.QPainterPath()
+    path.moveTo(size / 2.0, m)               # apex
+    path.lineTo(size - m, size - m)          # bottom-right
+    path.lineTo(m, size - m)                 # bottom-left
+    path.closeSubpath()
+    p.drawPath(path)
+    p.end()
+    return QtGui.QIcon(px)
+
+
 class ProjectStructureWidget(QWidget):
     """Hierarchical project tree shown above the histogram in the sidebar.
 
@@ -855,8 +896,17 @@ class ProjectStructureWidget(QWidget):
     grayvalue_activate_requested = Signal(int)
     grayvalue_remove_requested = Signal(int)
     grayvalue_export_requested = Signal(int)
+    create_surface_requested = Signal()
+    surface_activate_requested = Signal(int)
+    surface_remove_requested = Signal(int)
+    surface_export_stl_requested = Signal(int)
+    surface_promote_requested = Signal(int)
+    projectmesh_activate_requested = Signal(int)
+    projectmesh_export_stl_requested = Signal(int)
+    projectmesh_remove_requested = Signal(int)
 
     FOLDERS = ('Alignments', 'Measurements', 'Gray Values')
+    _MESH_FOLDERS = ('Alignments', 'Measurements')   # meshes have no Gray Values
 
     # Custom item-data roles (offset from UserRole).
     _ROLE_KIND = Qt.UserRole          # 'volume' | 'folder' | 'alignment'
@@ -907,6 +957,46 @@ class ProjectStructureWidget(QWidget):
         self.alignment_items = []
         self.measurement_items = []
         self.grayvalue_items = []
+        self.surface_items = []
+        self.project_mesh_items = []
+        self.volume_item.setExpanded(True)
+
+    def set_project_meshes(self, entries):
+        """Top-level mesh objects (siblings of Volume, shown below it), each a
+        first-class node carrying the same folder children as the Volume."""
+        for it in list(self.project_mesh_items):
+            idx = self.tree.indexOfTopLevelItem(it)
+            if idx >= 0:
+                self.tree.takeTopLevelItem(idx)
+        self.project_mesh_items = []
+        tri = _triangle_icon(self._icon_color)
+        folder_icon = _make_folder_icon(self._icon_color)
+        for i, e in enumerate(entries):
+            node = QtWidgets.QTreeWidgetItem(self.tree, [e['name']])
+            node.setData(0, self._ROLE_KIND, 'projectmesh')
+            node.setData(0, self._ROLE_INDEX, i)
+            node.setIcon(0, tri)
+            for fname in self._MESH_FOLDERS:
+                child = QtWidgets.QTreeWidgetItem(node, [fname])
+                child.setIcon(0, folder_icon)
+                child.setData(0, self._ROLE_KIND, 'folder')
+            node.setExpanded(True)
+            self.project_mesh_items.append(node)
+
+    def set_surfaces(self, entries):
+        """Rebuild the surface entries — direct children of Volume, shown right
+        under it (above the folders), each with a triangle icon."""
+        for it in self.surface_items:
+            self.volume_item.removeChild(it)
+        self.surface_items = []
+        icon = _triangle_icon(self._icon_color)
+        for i, e in enumerate(entries):
+            item = QtWidgets.QTreeWidgetItem([e['name']])
+            item.setData(0, self._ROLE_KIND, 'surface')
+            item.setData(0, self._ROLE_INDEX, i)
+            item.setIcon(0, icon)
+            self.volume_item.insertChild(i, item)   # before the folders
+            self.surface_items.append(item)
         self.volume_item.setExpanded(True)
 
     def set_alignments(self, entries, active_index):
@@ -982,12 +1072,43 @@ class ProjectStructureWidget(QWidget):
         if kind == 'volume':
             menu = QtWidgets.QMenu(self)
             rename_action = menu.addAction('Rename')
+            surface_action = menu.addAction('Create Surface...')
             props_action = menu.addAction('Properties...')
             chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
             if chosen == props_action:
                 self.properties_requested.emit()
+            elif chosen == surface_action:
+                self.create_surface_requested.emit()
             elif chosen == rename_action:
                 self.tree.editItem(item, 0)
+        elif kind == 'surface':
+            idx = int(item.data(0, self._ROLE_INDEX))
+            menu = QtWidgets.QMenu(self)
+            show_action = menu.addAction('Show in 3D')
+            export_menu = menu.addMenu('Export')
+            stl_action = export_menu.addAction('As STL...')
+            # 'Add to Project Structure' is hidden for now — to be reactivated later.
+            remove_action = menu.addAction('Remove')
+            chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
+            if chosen == show_action:
+                self.surface_activate_requested.emit(idx)
+            elif chosen == stl_action:
+                self.surface_export_stl_requested.emit(idx)
+            elif chosen == remove_action:
+                self.surface_remove_requested.emit(idx)
+        elif kind == 'projectmesh':
+            idx = int(item.data(0, self._ROLE_INDEX))
+            menu = QtWidgets.QMenu(self)
+            show_action = menu.addAction('Show in 3D')
+            stl_action = menu.addAction('Export As STL...')
+            remove_action = menu.addAction('Remove')
+            chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
+            if chosen == show_action:
+                self.projectmesh_activate_requested.emit(idx)
+            elif chosen == stl_action:
+                self.projectmesh_export_stl_requested.emit(idx)
+            elif chosen == remove_action:
+                self.projectmesh_remove_requested.emit(idx)
         elif kind == 'alignment':
             idx = int(item.data(0, self._ROLE_INDEX))
             is_initial = bool(item.data(0, self._ROLE_INITIAL))
@@ -1037,6 +1158,10 @@ class ProjectStructureWidget(QWidget):
             self.measurement_activate_requested.emit(int(item.data(0, self._ROLE_INDEX)))
         elif kind == 'grayvalue':
             self.grayvalue_activate_requested.emit(int(item.data(0, self._ROLE_INDEX)))
+        elif kind == 'surface':
+            self.surface_activate_requested.emit(int(item.data(0, self._ROLE_INDEX)))
+        elif kind == 'projectmesh':
+            self.projectmesh_activate_requested.emit(int(item.data(0, self._ROLE_INDEX)))
 
     def _on_item_changed(self, item, _col):
         if item is self.volume_item:
@@ -1065,6 +1190,13 @@ class ProjectStructureWidget(QWidget):
             kind = item.data(0, self._ROLE_SUBKIND)
             if kind:
                 item.setIcon(0, _grayvalue_icon(kind, self._icon_color))
+        triangle = _triangle_icon(self._icon_color)
+        for item in self.surface_items:
+            item.setIcon(0, triangle)
+        for node in self.project_mesh_items:
+            node.setIcon(0, triangle)
+            for c in range(node.childCount()):
+                node.child(c).setIcon(0, folder_icon)
         self.tree.blockSignals(False)
 
 
@@ -1093,6 +1225,11 @@ class BrightnessCurveWidget(QWidget):
 
     def init_ui(self):
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)  # match the Project Structure panel
+        layout.setSpacing(0)                    # no gap below the title
+        title = QLabel('Histogram')
+        title.setStyleSheet('font-weight: bold; padding: 0 4px 2px 4px;')  # tiny padding below only
+        layout.addWidget(title)
         self.plot_widget = pg.PlotWidget(background='w')
         self.plot_widget.setLabel('bottom', 'Intensity')
         self.plot_widget.setLabel('left', 'Mapped')
@@ -1499,6 +1636,27 @@ class SelectionOverlay(QWidget):
 
 
 _AXIS_LINE_COLORS = {'X': '#d94a4a', 'Y': '#4ab54a', 'Z': '#4a90d9'}
+
+# Green background applied to a header button while its mode is active (Lock,
+# Clip, coordinate lines/planes), as a quick visual cue that the mode is on.
+_ACTIVE_BTN_QSS = (
+    'QPushButton { background-color: #557a55; border: 1px solid #486848; '
+    'border-radius: 4px; }'
+    'QPushButton:hover { background-color: #608a60; }'
+)
+
+
+def _set_button_active(button, active: bool):
+    """Toggle the green 'active mode' background on a header button."""
+    button.setStyleSheet(_ACTIVE_BTN_QSS if active else '')
+
+
+# Red background for the record button while slice-video record mode is armed.
+_RECORD_BTN_QSS = (
+    'QPushButton { background-color: #8e1c1c; border: 1px solid #6e1414; '
+    'border-radius: 4px; }'
+    'QPushButton:hover { background-color: #a02323; }'
+)
 
 
 def _lock_icon(locked: bool) -> QtGui.QIcon:
@@ -1911,6 +2069,113 @@ def _coord_axes_icon() -> QtGui.QIcon:
     return icon
 
 
+def _draw_camera(p, x, w):
+    """Draw a camera (body + viewfinder bump + lens) into a horizontal band of
+    width ``w`` starting at ``x`` (20-px-tall logical canvas)."""
+    s = w / 15.0                      # scale relative to the full-width camera
+    cx = x + w / 2.0
+    p.drawPolyline(QtGui.QPolygonF([
+        QtCore.QPointF(cx - 3.0 * s, 6.0), QtCore.QPointF(cx - 1.7 * s, 3.8),
+        QtCore.QPointF(cx + 1.7 * s, 3.8), QtCore.QPointF(cx + 3.0 * s, 6.0)]))
+    p.drawRoundedRect(QtCore.QRectF(x, 6.0, w, 11.0), 2.0 * s, 2.0 * s)
+    p.drawEllipse(QtCore.QRectF(cx - 2.7 * s, 8.3, 5.4 * s, 5.4 * s))
+
+
+def _camera_icon(arrow=False) -> QtGui.QIcon:
+    """Monochrome camera icon. With ``arrow=True`` a down-arrow is drawn to the
+    right of a slightly smaller camera (the Save Image variant)."""
+    icon = QtGui.QIcon()
+    for dpr in (1.0, 2.0):
+        S = round(20 * dpr)
+        px = QtGui.QPixmap(S, S)
+        px.setDevicePixelRatio(dpr)
+        px.fill(Qt.transparent)
+        p = QtGui.QPainter(px)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        p.scale(S / 20.0, S / 20.0)
+        pen = QtGui.QPen(QtGui.QColor('#cccccc'), 1.5, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        if arrow:
+            _draw_camera(p, 1.5, 11.0)                  # compact camera on the left
+            p.drawLine(QtCore.QLineF(16.3, 5.5, 16.3, 12.0))                 # arrow shaft
+            p.drawPolyline(QtGui.QPolygonF([QtCore.QPointF(13.9, 9.6),
+                                            QtCore.QPointF(16.3, 12.6),
+                                            QtCore.QPointF(18.7, 9.6)]))     # arrowhead
+        else:
+            _draw_camera(p, 2.5, 15.0)                  # full-width camera
+        p.end()
+        icon.addPixmap(px)
+    return icon
+
+
+def _record_icon(active=False) -> QtGui.QIcon:
+    """A video-camera (movie) glyph: a rounded body with a lens triangle. When
+    ``active`` the lens fills red to signal that recording mode is armed."""
+    # Active state pairs with a dark-red button background, so the glyph goes
+    # white (not red) to stay clearly visible on it.
+    accent = '#ffffff' if active else '#cccccc'
+    icon = QtGui.QIcon()
+    for dpr in (1.0, 2.0):
+        S = round(20 * dpr)
+        px = QtGui.QPixmap(S, S)
+        px.setDevicePixelRatio(dpr)
+        px.fill(Qt.transparent)
+        p = QtGui.QPainter(px)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        p.scale(S / 20.0, S / 20.0)
+        pen = QtGui.QPen(QtGui.QColor(accent), 1.6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        # Camcorder body (rounded rectangle) on the left.
+        p.drawRoundedRect(QtCore.QRectF(2.5, 6.0, 10.0, 8.0), 1.5, 1.5)
+        # Lens/viewfinder spout pointing right.
+        p.drawPolygon(QtGui.QPolygonF([QtCore.QPointF(13.0, 8.0),
+                                       QtCore.QPointF(17.5, 6.0),
+                                       QtCore.QPointF(17.5, 14.0),
+                                       QtCore.QPointF(13.0, 12.0)]))
+        # A small record dot inside the body.
+        p.setBrush(QtGui.QColor(accent))
+        p.setPen(Qt.NoPen)
+        p.drawEllipse(QtCore.QPointF(6.0, 10.0), 1.6, 1.6)
+        p.end()
+        icon.addPixmap(px)
+    return icon
+
+
+def _make_camera_button(on_copy, on_save):
+    """A drop-down capture button: the main click runs the current action
+    (default Copy to Clipboard); the menu switches between Copy to Clipboard and
+    Save Image (and runs the chosen one). The button icon reflects the current
+    mode — plain camera for copy, camera+down-arrow for save."""
+    copy_icon = _camera_icon(arrow=False)
+    save_icon = _camera_icon(arrow=True)
+    btn = QtWidgets.QToolButton()
+    btn.setPopupMode(QtWidgets.QToolButton.MenuButtonPopup)
+    btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
+    btn.setIconSize(QtCore.QSize(16, 16))
+    btn.setFixedHeight(24)
+    state = {'mode': 'copy'}
+    menu = QtWidgets.QMenu(btn)
+
+    def set_mode(mode):
+        state['mode'] = mode
+        btn.setToolTip('Copy to Clipboard' if mode == 'copy' else 'Save Image')
+        btn.setIcon(copy_icon if mode == 'copy' else save_icon)
+
+    def run():
+        (on_copy if state['mode'] == 'copy' else on_save)()
+
+    act_copy = menu.addAction(copy_icon, 'Copy to Clipboard')
+    act_save = menu.addAction(save_icon, 'Save Image')
+    act_copy.triggered.connect(lambda: (set_mode('copy'), run()))
+    act_save.triggered.connect(lambda: (set_mode('save'), run()))
+    btn.setMenu(menu)
+    btn.clicked.connect(run)
+    set_mode('copy')
+    return btn
+
+
 class _GrayValuePicker:
     """Draggable yellow crosshair showing the X/Y/Z coords and gray value."""
 
@@ -2105,6 +2370,8 @@ class SliceViewer(QWidget):
     gray_value_created = Signal(object)            # a new gray-value graphic was made
     clip_changed = Signal()                        # clipping-plane toggle changed
     planes_toggled = Signal(bool)                  # coordinate-planes visibility toggle
+    record_mode_changed = Signal(bool)             # video-record mode entered/left
+    record_range_changed = Signal(int, int, int)   # (low, high, total) for the record axis
 
     _CLIP_STATES = ('off', 'left', 'right')
     _CLIP_TOOLTIP = {'off': 'Clipping plane: off',
@@ -2127,6 +2394,12 @@ class SliceViewer(QWidget):
         self._measure_tool = 'distance'
         self._gray_items = []
         self._gray_tool = 'picker'
+        self._surf_tri = None          # (M,3,3) surface triangle verts (display frame)
+        self._surf_shape = None        # display-frame dims for the plot flip
+        self._surf_tri_min = None      # (M,3) per-triangle min along each axis (cache)
+        self._surf_tri_max = None      # (M,3) per-triangle max along each axis (cache)
+        self._surf_outline_idx = None  # slice index the outline was last computed for
+        self._surf_outline_item = None # pg.PlotDataItem of the slice ∩ surface
         self._clip_state = 'off'
         self._display_levels = None
         self._auto_range_pending = True
@@ -2143,6 +2416,9 @@ class SliceViewer(QWidget):
         self._coord_lines_enabled = True
         self._pip = None   # picture-in-picture 3D preview, shown when maximized
         self._interpolate = False   # smooth (trilinear) vs nearest-neighbour voxels
+        self._record_mode = False   # slice-video recording range mode
+        self._recording = False     # actively grabbing/encoding frames
+        self._record_lines = []     # InfiniteLines marking another viewport's record range
         self.init_ui()
 
     def init_ui(self):
@@ -2216,6 +2492,17 @@ class SliceViewer(QWidget):
         self.planes_button.toggled.connect(self.planes_toggled)
         header.addWidget(self.planes_button)
 
+        self.camera_button = _make_camera_button(self._camera_copy, self._camera_save)
+        header.addWidget(self.camera_button)
+
+        self.record_button = QPushButton()
+        self.record_button.setIcon(_record_icon(False))
+        self.record_button.setFixedSize(24, 24)
+        self.record_button.setIconSize(QtCore.QSize(16, 16))
+        self.record_button.setToolTip('Record a slice-range video of this viewport')
+        self.record_button.clicked.connect(self.toggle_record_mode)
+        header.addWidget(self.record_button)
+
         header.addStretch()
         self.maximize_button = QPushButton('▲')
         self.maximize_button.setFixedSize(24, 24)
@@ -2252,6 +2539,7 @@ class SliceViewer(QWidget):
         self.slice_slider.setMaximum(0)
         self.slice_slider.valueChanged.connect(self.on_slice_changed)
         _axis_color = {'XY': '#4a90d9', 'YZ': '#d94a4a', 'XZ': '#4ab54a'}.get(self.orientation, '#888888')
+        self._axis_color = _axis_color
         self.slice_slider.setStyleSheet(f"""
             QSlider::groove:horizontal {{
                 height: 4px;
@@ -2282,11 +2570,43 @@ class SliceViewer(QWidget):
         self.slice_spin.setToolTip('Slice position in distance units')
         self.slice_spin.valueChanged.connect(self.on_slice_spin_changed)
 
+        # ── Record-mode widgets (hidden until the record button is pressed) ──
+        self.record_start_btn = QPushButton('Start')
+        self.record_start_btn.setFixedHeight(22)
+        self.record_start_btn.setToolTip('Render the slice range to a video file')
+        self.record_start_btn.clicked.connect(self._start_recording)
+        self.record_start_btn.hide()
+
+        self.record_len_spin = QtWidgets.QDoubleSpinBox()
+        self.record_len_spin.setDecimals(1)
+        self.record_len_spin.setRange(0.5, 600.0)
+        self.record_len_spin.setValue(10.0)
+        self.record_len_spin.setSingleStep(1.0)
+        self.record_len_spin.setSuffix(' s')
+        self.record_len_spin.setFixedWidth(72)
+        self.record_len_spin.setKeyboardTracking(False)
+        self.record_len_spin.setToolTip('Video length in seconds (30 FPS)')
+        self.record_len_spin.hide()
+
+        self.record_slider = RangeSlider()
+        self.record_slider.setSpanColor(self._axis_color)
+        self.record_slider.valueChanged.connect(self._on_record_range_changed)
+        self.record_slider.hide()
+
+        self.record_progress = QtWidgets.QProgressBar()
+        self.record_progress.setFixedHeight(18)
+        self.record_progress.setTextVisible(True)
+        self.record_progress.hide()
+
         bottom_bar = QWidget()
         bottom_bar.setFixedHeight(28)
         bottom = QHBoxLayout(bottom_bar)
         bottom.setContentsMargins(2, 2, 2, 2)
+        bottom.addWidget(self.record_start_btn)
+        bottom.addWidget(self.record_len_spin)
         bottom.addWidget(self.slice_slider)
+        bottom.addWidget(self.record_slider)
+        bottom.addWidget(self.record_progress)
         bottom.addWidget(self.slice_spin)
         layout.addWidget(bottom_bar)
 
@@ -2374,6 +2694,7 @@ class SliceViewer(QWidget):
 
     def set_locked(self, locked):
         self.lock_button.setIcon(_lock_icon(locked))
+        _set_button_active(self.lock_button, locked)
 
     def set_auto_mode(self, enabled):
         self.selection_overlay.set_active(enabled)
@@ -2528,6 +2849,7 @@ class SliceViewer(QWidget):
     def _update_clip_button(self):
         self.clip_button.setIcon(self._clip_icons[self._clip_state])
         self.clip_button.setToolTip(self._CLIP_TOOLTIP[self._clip_state])
+        _set_button_active(self.clip_button, self._clip_state != 'off')
 
     def _cycle_clip(self):
         i = self._CLIP_STATES.index(self._clip_state)
@@ -2714,6 +3036,9 @@ class SliceViewer(QWidget):
         self._sync_slice_spin()
 
     def set_volume(self, volume_data):
+        if self._record_mode:
+            self.set_record_mode(False)
+        self.clear_record_lines()
         self.volume_data = volume_data
         self._display_levels = None
         self._auto_range_pending = True
@@ -2751,6 +3076,14 @@ class SliceViewer(QWidget):
         """Map an edited distance value back to the nearest slice index."""
         sp = self._traversal_spacing()
         idx = int(round(value / sp)) if sp > 0 else 0
+        if self._record_mode:
+            # In record mode the spin drives the last-touched range handle.
+            idx = int(np.clip(idx, 0, max(0, self.slice_slider.maximum())))
+            if self.record_slider.last_handle() == 'low':
+                self.record_slider.setLow(idx)
+            else:
+                self.record_slider.setHigh(idx)
+            return
         idx = int(np.clip(idx, 0, max(0, self.slice_slider.maximum())))
         if idx != self.slice_slider.value():
             self.slice_slider.setValue(idx)   # → on_slice_changed re-syncs the spin
@@ -2882,6 +3215,7 @@ class SliceViewer(QWidget):
             self.image_view.getImageItem().setRect(
                 QtCore.QRectF(0, 0, image.shape[0], image.shape[1]))
             self.image_view.getView().setAspectLocked(True)
+            self._update_surface_outline()
             return
         # Temporary preview overrides permanent transform; permanent overrides raw slice.
         R_use = off_use = vol_use = shape_use = None
@@ -2916,6 +3250,7 @@ class SliceViewer(QWidget):
                 # so plot coordinates and aspect stay correct.
                 self.image_view.getImageItem().setRect(QtCore.QRectF(0, 0, wh[0], wh[1]))
                 self.image_view.getView().setAspectLocked(True)
+                self._update_surface_outline()
                 return
         vol = self.volume_data.volume
         if self.orientation == 'XY':
@@ -2939,6 +3274,105 @@ class SliceViewer(QWidget):
         self.image_view.getImageItem().setRect(
             QtCore.QRectF(0, 0, image.shape[0], image.shape[1]))
         self.image_view.getView().setAspectLocked(True)
+        self._update_surface_outline()
+
+    # ── Surface outline (slice ∩ surface mesh) ────────────────────────────────
+    def set_surface_outline(self, tri_verts, shape):
+        """Show the contour where ``tri_verts`` (an (M,3,3) array of surface mesh
+        triangles, in the display frame) crosses this viewport's current slice."""
+        self._surf_tri = tri_verts
+        self._surf_shape = shape
+        # Precompute per-triangle min/max along each axis ONCE so the per-slice
+        # spanning test is just two array comparisons (no reductions over the
+        # whole mesh every scroll/redraw).
+        if tri_verts is not None and len(tri_verts):
+            self._surf_tri_min = tri_verts.min(axis=1)   # (M, 3)
+            self._surf_tri_max = tri_verts.max(axis=1)   # (M, 3)
+        else:
+            self._surf_tri_min = self._surf_tri_max = None
+        self._surf_outline_idx = None                    # force a recompute
+        self._update_surface_outline()
+
+    def clear_surface_outline(self):
+        self._surf_tri = None
+        self._surf_shape = None
+        self._surf_tri_min = self._surf_tri_max = None
+        self._surf_outline_idx = None
+        if self._surf_outline_item is not None:
+            self._surf_outline_item.setData([], [])
+
+    def _update_surface_outline(self):
+        tri = self._surf_tri
+        item = self._surf_outline_item
+        if tri is None or self._surf_shape is None or self._surf_tri_min is None:
+            if item is not None:
+                item.setData([], [])
+            self._surf_outline_idx = None
+            return
+        idx = int(self.current_index)
+        # The contour depends only on the slice index, not on zoom/pan — the item
+        # lives in data coordinates and transforms with the view for free. So skip
+        # the whole recompute when the slice hasn't changed (the hot path during
+        # panning), and only rebuild it when actually scrolling to a new slice.
+        if idx == self._surf_outline_idx and item is not None:
+            return
+        self._surf_outline_idx = idx
+        axis = {'XY': 2, 'YZ': 0, 'XZ': 1}[self.orientation]
+        idx = float(idx)
+        span = (self._surf_tri_min[:, axis] <= idx) & (self._surf_tri_max[:, axis] >= idx)
+        xs = ys = None
+        if span.any():
+            t = tri[span]
+            s = t[:, :, axis] - idx                    # (K,3) signed distance to plane
+            neg = s < 0
+            c01 = neg[:, 0] != neg[:, 1]
+            c12 = neg[:, 1] != neg[:, 2]
+            c20 = neg[:, 2] != neg[:, 0]
+            keep = (c01.astype(np.int8) + c12 + c20) == 2   # clean crossings
+            if keep.any():
+                t = t[keep]; s = s[keep]
+                c01, c12, c20 = c01[keep], c12[keep], c20[keep]
+                s0, s1, s2 = s[:, 0], s[:, 1], s[:, 2]
+                v0, v1, v2 = t[:, 0], t[:, 1], t[:, 2]
+
+                def interp(sa, sb, va, vb):
+                    # Non-crossing edges divide by ~0 → NaN, but those entries are
+                    # discarded by the np.where below; silence the warning.
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        tt = (sa / (sa - sb))[:, None]
+                        return va + tt * (vb - va)
+
+                p01, p12, p20 = interp(s0, s1, v0, v1), interp(s1, s2, v1, v2), interp(s2, s0, v2, v0)
+                A = np.where(c01[:, None], p01, np.where(c12[:, None], p12, p20))
+                B = np.where(c20[:, None], p20, np.where(c12[:, None], p12, p01))
+                h, v, vdim = self._outline_plot_axes()
+                n = A.shape[0]
+                xs = np.empty(2 * n, dtype=np.float32)
+                ys = np.empty(2 * n, dtype=np.float32)
+                xs[0::2] = A[:, h]; xs[1::2] = B[:, h]
+                ys[0::2] = (vdim - 1) - A[:, v]; ys[1::2] = (vdim - 1) - B[:, v]
+        if item is None:
+            # antialias=False keeps the (often many-segment) contour cheap to
+            # repaint while panning/zooming. (clipToView is avoided: it can split
+            # connect='pairs' segments at the view edge.)
+            item = pg.PlotDataItem(pen=pg.mkPen(_MEAS_COLOR, width=2), antialias=False)
+            item.setZValue(20)
+            self.image_view.getView().addItem(item, ignoreBounds=True)
+            self._surf_outline_item = item
+        if xs is None:
+            item.setData([], [])
+        else:
+            item.setData(xs, ys, connect='pairs', skipFiniteCheck=True)
+
+    def _outline_plot_axes(self):
+        """(horizontal volume axis, vertical volume axis, vertical dim) for the
+        current orientation — vertical axis is shown flipped in the plot."""
+        sh = self._surf_shape
+        if self.orientation == 'XY':
+            return 0, 1, int(sh[1])   # plot-x = X, plot-y = ny-1-Y
+        if self.orientation == 'YZ':
+            return 1, 2, int(sh[2])   # plot-x = Y, plot-y = nz-1-Z
+        return 0, 2, int(sh[2])       # XZ: plot-x = X, plot-y = nz-1-Z
 
     def on_image_click(self, event):
         if self.volume_data is None or self.volume_data.volume is None:
@@ -2954,35 +3388,28 @@ class SliceViewer(QWidget):
         if mapped is not None:
             self.point_placed.emit(mapped)
 
+    def _axis_line_geom(self, axis, index, total):
+        """(angle, pos) for a coordinate line of ``axis`` in this viewport's plot
+        space, or None if ``axis`` is this viewport's own traversal axis.
+        Vertical (angle=90): axis is the horizontal dim, no flip. Horizontal
+        (angle=0): axis is the vertical dim, always flipped ([::-1])."""
+        pairs = {'XY': ('X', 'Y'), 'YZ': ('Y', 'Z'), 'XZ': ('X', 'Z')}.get(self.orientation)
+        if pairs is None:
+            return None
+        h_axis, v_axis = pairs
+        if axis == h_axis:
+            return 90, index
+        if axis == v_axis:
+            return 0, total - 1 - index
+        return None  # this viewport's own traversal axis
+
     def show_axis_line(self, axis, index, total, seg_range=None):
         if not self._coord_lines_enabled:
             return
-        # Compute angle + position for this viewport's coordinate space.
-        # Vertical (angle=90): the axis is the horizontal dimension here, no flip.
-        # Horizontal (angle=0): the axis is the vertical dimension, always flipped ([::-1]).
-        if self.orientation == 'XY':
-            if axis == 'X':
-                angle, pos = 90, index
-            elif axis == 'Y':
-                angle, pos = 0, total - 1 - index
-            else:
-                return  # Z is this viewport's own traversal axis
-        elif self.orientation == 'YZ':
-            if axis == 'Y':
-                angle, pos = 90, index
-            elif axis == 'Z':
-                angle, pos = 0, total - 1 - index
-            else:
-                return  # X is this viewport's own traversal axis
-        elif self.orientation == 'XZ':
-            if axis == 'X':
-                angle, pos = 90, index
-            elif axis == 'Z':
-                angle, pos = 0, total - 1 - index
-            else:
-                return  # Y is this viewport's own traversal axis
-        else:
+        geom = self._axis_line_geom(axis, index, total)
+        if geom is None:
             return
+        angle, pos = geom
 
         color = _AXIS_LINE_COLORS[axis]
         view = self.image_view.getView()
@@ -3059,8 +3486,250 @@ class SliceViewer(QWidget):
     def set_coord_lines_enabled(self, enabled):
         """Enable/disable the coordinate lines in this 2D viewport."""
         self._coord_lines_enabled = bool(enabled)
+        _set_button_active(self.planes_button, bool(enabled))
         if not enabled:
             self._clear_axis_lines()
+
+    # ── Slice-video recording ─────────────────────────────────────────────────
+    def toggle_record_mode(self):
+        self.set_record_mode(not self._record_mode)
+
+    def set_record_mode(self, on):
+        """Enter/leave the slice-video range-selection mode for this viewport."""
+        if self._recording:
+            return
+        on = bool(on) and self.volume_data is not None and self.volume_data.is_loaded()
+        self._record_mode = on
+        self.record_button.setIcon(_record_icon(on))
+        self.record_button.setStyleSheet(_RECORD_BTN_QSS if on else '')
+        if on:
+            mx = max(0, self.slice_slider.maximum())
+            self.record_slider.setRange(0, mx)
+            self.record_slider.blockSignals(True)
+            self.record_slider.setValues(0, mx)
+            self.record_slider._last = 'high'
+            self.record_slider.blockSignals(False)
+            self.slice_slider.hide()
+            self.record_progress.hide()
+            self.record_slider.show()
+            self.record_start_btn.show()
+            self.record_len_spin.show()
+            self.current_index = self.record_slider.last_value()
+            self.update_image()
+            self._sync_slice_spin()
+            self._emit_record_range()
+        else:
+            self.record_slider.hide()
+            self.record_start_btn.hide()
+            self.record_len_spin.hide()
+            self.record_progress.hide()
+            self.slice_slider.show()
+            self.slice_slider.blockSignals(True)
+            self.slice_slider.setValue(int(np.clip(self.current_index, 0,
+                                                   max(0, self.slice_slider.maximum()))))
+            self.slice_slider.blockSignals(False)
+            self._sync_slice_spin()
+        self.record_mode_changed.emit(on)
+
+    def _emit_record_range(self):
+        shape = self._active_shape()
+        if shape is None:
+            return
+        total = shape[self._traversal_axis()]
+        self.record_range_changed.emit(self.record_slider.low(),
+                                       self.record_slider.high(), total)
+
+    def _on_record_range_changed(self):
+        """A record handle moved: show the last-touched endpoint as the live slice."""
+        self.current_index = self.record_slider.last_value()
+        self.update_image()
+        self._sync_slice_spin()
+        self._emit_record_range()
+
+    def show_record_lines(self, axis, low, high, total):
+        """Draw two solid lines marking another viewport's record range (its two
+        endpoints). Persistent until cleared; independent of the coord-line toggle."""
+        self.clear_record_lines()
+        view = self.image_view.getView()
+        color = _AXIS_LINE_COLORS.get(axis)
+        for idx in (low, high):
+            geom = self._axis_line_geom(axis, idx, total)
+            if geom is None:
+                continue
+            angle, pos = geom
+            line = pg.InfiniteLine(pos=pos, angle=angle,
+                                   pen=pg.mkPen(color=color, width=2, style=Qt.SolidLine))
+            view.addItem(line, ignoreBounds=True)
+            self._record_lines.append(line)
+
+    def clear_record_lines(self):
+        view = self.image_view.getView()
+        for ln in self._record_lines:
+            try:
+                view.removeItem(ln)
+            except Exception:
+                pass
+        self._record_lines = []
+
+    def _grab_frame_array(self):
+        """Grab the current 2D view as a contiguous (H, W, 3) uint8 RGB array."""
+        gv = self.image_view.ui.graphicsView
+        img = gv.viewport().grab().toImage().convertToFormat(QtGui.QImage.Format_RGB888)
+        w, h, bpl = img.width(), img.height(), img.bytesPerLine()
+        ptr = img.constBits()
+        try:
+            ptr.setsize(h * bpl)          # PyQt5: sip.voidptr needs an explicit size
+        except AttributeError:
+            pass                          # PySide6: already a sized memoryview
+        arr = np.frombuffer(bytes(ptr), dtype=np.uint8).reshape(h, bpl)
+        return np.ascontiguousarray(arr[:, : w * 3].reshape(h, w, 3))
+
+    def _start_recording(self):
+        if self._recording or self.volume_data is None or not self.volume_data.is_loaded():
+            return
+        low, high = self.record_slider.low(), self.record_slider.high()
+        if high < low:
+            low, high = high, low
+        fps = 30
+        n_frames = max(2, int(round(float(self.record_len_spin.value()) * fps)))
+        path, sel = QFileDialog.getSaveFileName(
+            self, 'Save Slice Video', '',
+            'MP4 Video (*.mp4);;Animated GIF (*.gif)')
+        if not path:
+            return
+        is_gif = path.lower().endswith('.gif') or 'GIF' in (sel or '')
+        if not is_gif and not path.lower().endswith('.mp4'):
+            path += '.mp4'
+        indices = [int(round(v)) for v in np.linspace(low, high, n_frames)]
+        self._run_recording(path, indices, fps, is_gif)
+
+    def _run_recording(self, path, indices, fps, is_gif):
+        import tempfile, shutil
+        try:
+            import imageio
+        except Exception:
+            QMessageBox.warning(self, 'Record Video',
+                                'The imageio package is required to export video.')
+            return
+        # Encode to a temp file first, then move it to the user-chosen path. Under
+        # the App Store sandbox the ffmpeg child process can write into the app's
+        # own temp dir but not to an arbitrary user location (the save-panel grant
+        # belongs to this process, not the child); the move here runs in-process
+        # and does carry that grant. It also avoids leaving a half-written file.
+        ext = '.gif' if is_gif else '.mp4'
+        fd, tmp_path = tempfile.mkstemp(suffix=ext)
+        os.close(fd)
+        # Open the writer (mp4 via bundled ffmpeg; gif via pillow).
+        try:
+            if is_gif:
+                writer = imageio.get_writer(tmp_path, mode='I', duration=1.0 / fps, loop=0)
+            else:
+                writer = imageio.get_writer(
+                    tmp_path, format='FFMPEG', mode='I', fps=fps, codec='libx264',
+                    macro_block_size=None, ffmpeg_log_level='error',
+                    output_params=['-pix_fmt', 'yuv420p'])
+        except Exception as exc:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            QMessageBox.warning(
+                self, 'Record Video',
+                'Could not start the video encoder.\n\nFor MP4 you may need the '
+                f'imageio-ffmpeg package installed.\n\n{exc}')
+            return
+
+        saved_index = self.current_index
+        self._recording = True
+        self.record_start_btn.setEnabled(False)
+        self.record_len_spin.setEnabled(False)
+        self.record_button.setEnabled(False)
+        self.record_slider.hide()
+        self.record_progress.setRange(0, len(indices))
+        self.record_progress.setValue(0)
+        self.record_progress.setFormat('Recording… %p%')
+        self.record_progress.show()
+        frame_shape = None
+        err = None
+        try:
+            for i, idx in enumerate(indices):
+                self.current_index = int(np.clip(idx, 0, max(0, self.slice_slider.maximum())))
+                self.update_image()
+                QApplication.processEvents()
+                frame = self._grab_frame_array()
+                # Even dimensions for yuv420p; keep all frames the same size.
+                if frame_shape is None:
+                    h, w = frame.shape[:2]
+                    frame_shape = (h - h % 2, w - w % 2)
+                frame = frame[:frame_shape[0], :frame_shape[1]]
+                writer.append_data(frame)
+                self.record_progress.setValue(i + 1)
+                QApplication.processEvents()
+        except Exception as exc:
+            err = exc
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+            self._recording = False
+            self.current_index = saved_index
+            self.update_image()
+            self._sync_slice_spin()
+            self.record_start_btn.setEnabled(True)
+            self.record_len_spin.setEnabled(True)
+            self.record_button.setEnabled(True)
+            self.record_progress.hide()
+            if self._record_mode:
+                self.record_slider.show()
+        # Move the finished encode to the destination (in-process: keeps the
+        # save-panel file grant under sandbox). Clean up the temp file on failure.
+        if err is None:
+            try:
+                shutil.move(tmp_path, path)
+            except Exception as exc:
+                err = exc
+        if err is not None:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            QMessageBox.warning(self, 'Record Video',
+                                f'Recording failed:\n{err}')
+        else:
+            QMessageBox.information(
+                self, 'Record Video',
+                f'Saved {len(indices)} frames to:\n{path}')
+
+    # ── Capture (camera button) ───────────────────────────────────────────────
+    def _camera_save(self):
+        """Save the viewport image directly via pyqtgraph's Image File exporter
+        (PNG/JPG/TIFF/…) — a plain file dialog, not the full Export dialog."""
+        path, _ = QFileDialog.getSaveFileName(
+            self, 'Save Image', '',
+            'PNG Image (*.png);;JPEG Image (*.jpg);;TIFF Image (*.tif);;All Files (*)')
+        if not path:
+            return
+        if not any(path.lower().endswith(e)
+                   for e in ('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp')):
+            path += '.png'
+        try:
+            import pyqtgraph.exporters as _pgexp
+            _pgexp.ImageExporter(self.image_view.getView()).export(path)
+        except Exception as exc:
+            QMessageBox.warning(self, 'Save Image', f'Could not save the image:\n{exc}')
+
+    def _camera_copy(self):
+        """Copy the viewport image to the clipboard."""
+        try:
+            import pyqtgraph.exporters as _pgexp
+            _pgexp.ImageExporter(self.image_view.getView()).export(copy=True)
+        except Exception:
+            # Fallback: grab the rendered widget straight to the clipboard.
+            try:
+                QApplication.clipboard().setPixmap(self.image_view.grab())
+            except Exception as exc:
+                QMessageBox.warning(self, 'Copy to Clipboard', f'Could not copy the image:\n{exc}')
 
     def map_to_volume_coordinates(self, x, y):
         if self.volume_data is None or self.volume_data.volume is None:
@@ -3224,6 +3893,11 @@ class VolumeRender3D(QWidget):
         # recomputing the surface or re-normalising the volume each frame.
         self._iso_cache = None        # (verts, faces) from the FULL volume
         self._iso_cache_key = None
+        self._showing_surface = False # a created STL surface is shown (not the volume)
+        self._surface = None          # (verts, faces) of the shown surface
+        self._surface_shape = None    # source-volume shape the surface verts live in
+        self._surface_tri = None      # cached verts[faces] for the 2D outline
+        self._surface_color = (0.78, 0.88, 1.0, 1.0)
         self._rgba_base = None        # full-volume RGBA (original alpha)
         self._rgba_cache_key = None
         self._plane_fracs = {}        # axis(0/1/2) -> slice fraction [0,1]
@@ -3258,7 +3932,7 @@ class VolumeRender3D(QWidget):
             lambda: self.iso_slider.setValue(self.iso_spinbox.value()))
 
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(['Isosurface', 'Phong Volume'])
+        self.mode_combo.addItems(['Isosurface', 'Phong Volume', 'Off'])
         self.mode_combo.currentTextChanged.connect(self.on_mode_changed)
 
         header_bar = QWidget()
@@ -3281,6 +3955,10 @@ class VolumeRender3D(QWidget):
         self.planes_button.setToolTip('Show coordinate planes')
         self.planes_button.toggled.connect(self.planes_toggled)
         header.addWidget(self.planes_button)
+
+        self.camera_button = _make_camera_button(self._camera_copy, self._camera_save)
+        header.addWidget(self.camera_button)
+
         header.addStretch()
         self.maximize_button = QPushButton('▲')
         self.maximize_button.setFixedSize(24, 24)
@@ -3405,6 +4083,37 @@ class VolumeRender3D(QWidget):
         self._alignment_mode = active
         self.gl_view.set_pick_mode(active)
 
+    # ── Capture (camera button) ───────────────────────────────────────────────
+    def _grab_image(self):
+        """Render the current 3D view to a QImage (or None)."""
+        try:
+            return self.gl_view.grabFramebuffer()
+        except Exception:
+            return None
+
+    def _camera_copy(self):
+        img = self._grab_image()
+        if img is not None and not img.isNull():
+            QApplication.clipboard().setImage(img)
+        else:
+            QMessageBox.warning(self, 'Copy to Clipboard', 'Could not capture the 3D view.')
+
+    def _camera_save(self):
+        img = self._grab_image()
+        if img is None or img.isNull():
+            QMessageBox.warning(self, 'Save Image', 'Could not capture the 3D view.')
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, 'Save Image', '',
+            'PNG Image (*.png);;JPEG Image (*.jpg);;TIFF Image (*.tif);;All Files (*)')
+        if not path:
+            return
+        if not any(path.lower().endswith(e)
+                   for e in ('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp')):
+            path += '.png'
+        if not img.save(path):
+            QMessageBox.warning(self, 'Save Image', f'Could not save the image to:\n{path}')
+
     def _on_gl_pick(self, screen_pos):
         """Called by _GLView when a Cmd/Ctrl+click is detected."""
         pt = self._pick_volume_point(screen_pos)
@@ -3516,6 +4225,115 @@ class VolumeRender3D(QWidget):
             return [item]
         except Exception:
             return []
+
+    def set_geometry_overlay(self, points, geom_type, fit):
+        """Show picked points (yellow dots) plus the fitted geometry (yellow
+        wireframe) for the Geometry-based alignment. Reuses the alignment-overlay
+        item list, so clear_alignment_overlays() tears it down."""
+        self.clear_alignment_overlays()
+        self._alignment_points = list(points)
+
+        def add(item):
+            if item is None:
+                return
+            try:
+                self.gl_view.addItem(item)
+                self._alignment_gl_items.append(item)
+            except Exception:
+                pass
+
+        for pt in points:
+            try:
+                add(gl.GLScatterPlotItem(pos=self._voxel_to_gl(pt).reshape(1, 3),
+                                         color=(1.0, 1.0, 0.0, 1.0), size=8, pxMode=True))
+            except Exception:
+                pass
+        if fit is not None:
+            for item in self._make_geometry_wire(geom_type, fit, points):
+                add(item)
+
+    def _gl_dir(self, voxel_dir):
+        """A voxel-space direction in GL space (uniform downsample scale)."""
+        d = np.asarray(voxel_dir, dtype=np.float64)
+        n = np.linalg.norm(d)
+        return d / n if n > 1e-9 else d
+
+    @staticmethod
+    def _perp_basis(axis):
+        a = np.asarray(axis, dtype=np.float64)
+        a = a / (np.linalg.norm(a) or 1.0)
+        ref = np.array([1.0, 0.0, 0.0]) if abs(a[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        e1 = np.cross(a, ref); e1 /= (np.linalg.norm(e1) or 1.0)
+        e2 = np.cross(a, e1)
+        return e1, e2
+
+    @staticmethod
+    def _circle_strip(center, e1, e2, radius, n=48):
+        ang = np.linspace(0.0, 2.0 * np.pi, n)
+        pts = (center[None, :] + radius * (np.cos(ang)[:, None] * e1[None, :]
+                                           + np.sin(ang)[:, None] * e2[None, :]))
+        return pts.astype(np.float32)
+
+    def _make_geometry_wire(self, geom_type, fit, points):
+        """Yellow wireframe items for the fitted plane / cylinder / cone."""
+        items = []
+        try:
+            factor = max(self._render_factor, 1)
+            gpts = np.array([self._voxel_to_gl(p) for p in points], dtype=np.float64)
+            pad = max(max(self._render_shape) * 0.05, 4.0)
+            yellow = (1.0, 1.0, 0.0, 0.9)
+            if geom_type == 'Plane':
+                z = self._gl_dir(fit['normal'])
+                c = self._voxel_to_gl(fit['point']).astype(np.float64)
+                e1, e2 = self._perp_basis(z)
+                du = (gpts - c) @ e1
+                dv = (gpts - c) @ e2
+                hu = float(np.max(np.abs(du))) + pad if len(gpts) else 10.0
+                hv = float(np.max(np.abs(dv))) + pad if len(gpts) else 10.0
+                corners = np.array([
+                    c + e1 * hu + e2 * hv, c - e1 * hu + e2 * hv,
+                    c - e1 * hu - e2 * hv, c + e1 * hu - e2 * hv,
+                    c + e1 * hu + e2 * hv], dtype=np.float32)
+                items.append(gl.GLLinePlotItem(pos=corners, color=yellow, width=2,
+                                               antialias=True, mode='line_strip'))
+            elif geom_type == 'Cylinder':
+                a = self._gl_dir(fit['axis'])
+                c = self._voxel_to_gl(fit['point']).astype(np.float64)
+                r = float(fit['radius']) / factor
+                e1, e2 = self._perp_basis(a)
+                ts = (gpts - c) @ a if len(gpts) else np.array([-10.0, 10.0])
+                tmin, tmax = float(ts.min()) - pad, float(ts.max()) + pad
+                for tt in (tmin, tmax):
+                    ring = self._circle_strip(c + tt * a, e1, e2, r)
+                    items.append(gl.GLLinePlotItem(pos=ring, color=yellow, width=2,
+                                                   antialias=True, mode='line_strip'))
+                for k in range(6):
+                    ang = 2.0 * np.pi * k / 6.0
+                    dirv = np.cos(ang) * e1 + np.sin(ang) * e2
+                    seg = np.array([c + tmin * a + r * dirv,
+                                    c + tmax * a + r * dirv], dtype=np.float32)
+                    items.append(gl.GLLinePlotItem(pos=seg, color=yellow, width=1,
+                                                   antialias=True, mode='lines'))
+            elif geom_type == 'Cone':
+                a = self._gl_dir(fit['axis'])
+                v = self._voxel_to_gl(fit['apex']).astype(np.float64)
+                e1, e2 = self._perp_basis(a)
+                ts = (gpts - v) @ a if len(gpts) else np.array([10.0, 40.0])
+                tmax = float(ts.max()) + pad
+                rbase = max(tmax, 0.0) * math.tan(float(fit['half_angle']))
+                base_c = v + tmax * a
+                ring = self._circle_strip(base_c, e1, e2, rbase)
+                items.append(gl.GLLinePlotItem(pos=ring, color=yellow, width=2,
+                                               antialias=True, mode='line_strip'))
+                for k in range(8):
+                    ang = 2.0 * np.pi * k / 8.0
+                    edge = base_c + rbase * (np.cos(ang) * e1 + np.sin(ang) * e2)
+                    seg = np.array([v, edge], dtype=np.float32)
+                    items.append(gl.GLLinePlotItem(pos=seg, color=yellow, width=1,
+                                                   antialias=True, mode='lines'))
+        except Exception:
+            pass
+        return items
 
     def _voxel_to_gl(self, voxel_pt):
         """Convert voxel coords to GL world coords (accounting for downsampling)."""
@@ -3681,9 +4499,24 @@ class VolumeRender3D(QWidget):
 
     def on_mode_changed(self, text):
         self.mode = text
+        if text == 'Off':
+            self.iso_slider.setEnabled(False)
+            self.iso_spinbox.setEnabled(False)
+            self._showing_surface = False
+            self._render_off()
+            return
+        if text == 'Surface Mesh':
+            self.iso_slider.setEnabled(False)
+            self.iso_spinbox.setEnabled(False)
+            self._showing_surface = True
+            # Place the surface in the isosurface's (mode-independent) frame.
+            self._set_render_frame(self._surface_render_voxels())
+            self._render_surface(reset_camera=False)   # keep the volume's view
+            return
         iso_active = (text == 'Isosurface')
         self.iso_slider.setEnabled(iso_active)
         self.iso_spinbox.setEnabled(iso_active)
+        self._showing_surface = False
         self.update_view()
 
     def on_iso_slider_changed(self, value):
@@ -3700,6 +4533,98 @@ class VolumeRender3D(QWidget):
         self._display_levels = None
         self._clips = {}
         self.update_view()
+
+    def set_surface_available(self, available):
+        """Add/remove the 'Surface Mesh' option in the renderer dropdown. It is
+        only present while at least one surface exists under the volume."""
+        i = self.mode_combo.findText('Surface Mesh')
+        if available and i < 0:
+            # Keep 'Off' last: insert Surface Mesh just before it.
+            off = self.mode_combo.findText('Off')
+            self.mode_combo.insertItem(off if off >= 0 else self.mode_combo.count(),
+                                       'Surface Mesh')
+        elif not available and i >= 0:
+            if self.mode_combo.currentText() == 'Surface Mesh':
+                self.clear_surface()                  # revert to the volume first
+            i = self.mode_combo.findText('Surface Mesh')
+            if i >= 0:
+                self.mode_combo.removeItem(i)
+
+    def show_surface(self, verts, faces, color=None, source_shape=None):
+        """Load a surface mesh and switch the renderer to 'Surface Mesh'.
+
+        ``source_shape`` is the shape of the (full-resolution) volume the surface
+        verts live in; it places the mesh in the same coordinate frame as the
+        volume/isosurface so the two coincide in space."""
+        verts = np.asarray(verts, dtype=np.float32)
+        faces = np.asarray(faces, dtype=np.int32)
+        self._surface = (verts, faces)
+        self._surface_shape = tuple(source_shape) if source_shape is not None else None
+        # Precompute triangle vertices once for the fast 2D slice-outline.
+        self._surface_tri = verts[faces] if len(faces) else None
+        if color is not None:
+            self._surface_color = color
+        self.set_surface_available(True)
+        self.mode = 'Surface Mesh'
+        self._showing_surface = True
+        self.iso_slider.setEnabled(False)
+        self.iso_spinbox.setEnabled(False)
+        self.mode_combo.blockSignals(True)
+        self.mode_combo.setCurrentText('Surface Mesh')
+        self.mode_combo.blockSignals(False)
+        # Establish the isosurface's (mode-independent) render frame so the mesh
+        # is placed/scaled identically every time — including after a project
+        # reload, where the saved camera is stored against this exact frame.
+        self._set_render_frame(self._surface_render_voxels())
+        # Don't reset the camera — keep exactly the volume's view so switching
+        # renderers doesn't move the object.
+        self._render_surface(reset_camera=False)
+
+    def clear_surface(self):
+        """Stop showing a surface and return to the volume display."""
+        self._showing_surface = False
+        self._surface = None
+        self._surface_tri = None
+        if self.mode == 'Surface Mesh':
+            self.mode = 'Isosurface'
+            self.mode_combo.blockSignals(True)
+            self.mode_combo.setCurrentText('Isosurface')
+            self.mode_combo.blockSignals(False)
+            self.iso_slider.setEnabled(True)
+            self.iso_spinbox.setEnabled(True)
+        self.update_view()
+
+    def _render_surface(self, reset_camera=False):
+        self.gl_view.clear()
+        self._alignment_gl_items = []
+        self._plane_items = []
+        self.status_text.setText('')
+        if not self._surface:
+            return
+        verts, faces = self._surface
+        if verts is None or len(verts) == 0 or len(faces) == 0:
+            self.status_text.setText('Empty surface')
+            return
+        verts = np.asarray(verts, dtype=np.float64)
+        rshape = np.asarray(self._render_shape, dtype=np.float64)
+        sshape = (np.asarray(self._surface_shape, dtype=np.float64)
+                  if self._surface_shape is not None else None)
+        if sshape is not None and np.all(sshape > 0) and np.all(rshape > 1):
+            # Same coordinate frame as the volume/isosurface: map the full-res
+            # source-voxel coords into the downsampled render frame, centred like
+            # render_isosurface (which translates by -render_shape/2).
+            gl_verts = (verts * (rshape / sshape) - rshape / 2.0).astype(np.float32)
+        else:
+            lo = verts.min(axis=0)
+            hi = verts.max(axis=0)
+            gl_verts = (verts - (lo + hi) / 2.0).astype(np.float32)
+        md = gl.MeshData(vertexes=gl_verts, faces=np.asarray(faces))
+        mesh = gl.GLMeshItem(meshdata=md, smooth=True, shader='shaded',
+                             drawEdges=False, glOptions='opaque',
+                             color=self._surface_color)
+        self.gl_view.addItem(mesh)
+        if reset_camera:
+            self.gl_view.setCameraPosition(distance=max(self._render_shape) * 2.5)
 
     def set_levels(self, min_val, max_val):
         """Set the histogram window applied to the rendered volume."""
@@ -3749,11 +4674,18 @@ class VolumeRender3D(QWidget):
         Re-renders the cached volume (debounced) without disturbing the camera.
         """
         self._clips = dict(clips)
-        active = bool(self._clips)
+        # Clipping only affects the volume / isosurface render. While a Surface
+        # Mesh is shown (or the renderer is Off) there is nothing to re-clip, and
+        # the debounced re-render would otherwise rebuild the whole surface mesh
+        # on every slice scroll / locked pan — recomputing normals + re-uploading
+        # the VBO for a multi-million-triangle mesh — which freezes the UI. Skip
+        # all of it in those modes.
+        inactive_mode = self._showing_surface or self.mode == 'Off'
+        active = bool(self._clips) and not inactive_mode
         self.clip_hint.setVisible(active)
         if active:
             self._reposition_clip_hint()
-        if self._render_volume is None:
+        if self._render_volume is None or inactive_mode:
             return
         if not self._clip_timer.isActive():
             self._clip_timer.start(80)
@@ -3777,6 +4709,7 @@ class VolumeRender3D(QWidget):
     def set_planes_visible(self, visible):
         """Enable/disable the coordinate planes."""
         self._show_planes = bool(visible)
+        _set_button_active(self.planes_button, bool(visible))
         self._draw_coord_planes()
 
     def _draw_coord_planes(self):
@@ -3786,6 +4719,9 @@ class VolumeRender3D(QWidget):
             except Exception:
                 pass
         self._plane_items = []
+        # 'Off' renderer hides everything for this object, navigation planes too.
+        if self.mode == 'Off':
+            return
         if not self._show_planes or self._render_volume is None or not self._plane_fracs:
             return
         shape = self._render_shape
@@ -3881,7 +4817,21 @@ class VolumeRender3D(QWidget):
                 keep &= coords[:, ax] <= plane
         return keep
 
+    def _render_off(self):
+        """'Off' renderer: draw nothing for this object — no volume, isosurface,
+        surface mesh, coordinate planes, or overlays appear in the 3D view."""
+        self.gl_view.clear()
+        self._alignment_gl_items = []
+        self._plane_items = []
+        self.status_text.setText('')
+
     def update_view(self):
+        if self.mode == 'Off':
+            self._render_off()
+            return
+        if self._showing_surface and self._surface is not None:
+            self._render_surface(reset_camera=False)
+            return
         if self.volume_data is None or self.volume_data.volume is None:
             self.gl_view.clear()
             self._alignment_gl_items = []
@@ -3891,10 +4841,18 @@ class VolumeRender3D(QWidget):
             self._render_shape = (1, 1, 1)
             self._render_volume = None
             return
-        # Use permanent aligned display volume if one has been set.
+        self._set_render_frame(self._max_render_voxels())
+        self._render_scene(reset_camera=True)
+
+    def _set_render_frame(self, max_voxels):
+        """Compute and cache the downsampled render volume + its shape/range for
+        ``max_voxels`` (the world frame the 3D scene is placed in). Returns the
+        render shape, or None if no volume is loaded."""
+        if self.volume_data is None or self.volume_data.volume is None:
+            return None
+        # Use the permanent aligned display volume if one has been set.
         raw = self._perm_volume if self._perm_volume is not None else self.volume_data.volume
         # Downsample FIRST (keeps the peak RAM from astype small)
-        max_voxels = self._max_render_voxels()
         if raw.size > max_voxels:
             factor = max(1, int(np.ceil((raw.size / max_voxels) ** (1.0 / 3.0))))
             raw = raw[::factor, ::factor, ::factor]
@@ -3906,10 +4864,29 @@ class VolumeRender3D(QWidget):
         self._render_volume = volume
         self._render_vol_min = float(np.min(volume))
         self._render_vol_max = float(np.max(volume))
-        self._render_scene(reset_camera=True)
+        return self._render_shape
+
+    def _surface_render_voxels(self):
+        """Voxel budget for placing a created Surface Mesh. Deliberately the same
+        budget the isosurface uses (its 256³ cap), so a surface sits in exactly
+        the isosurface's world frame AND that frame never depends on which volume
+        render last ran. Without this the surface scale (and the saved camera that
+        is stored against it) would shift between Isosurface and Phong, which broke
+        surfaces reloaded from a saved project."""
+        base = {'Low': 256, 'Default': 512, 'High': 1024}.get(self._quality, 512)
+        return min(base, 256) ** 3
 
     def _render_scene(self, reset_camera=False):
         """(Re)build the 3D scene from the cached render volume + active clips."""
+        if self.mode == 'Off':
+            self._render_off()
+            return
+        # A created surface owns the 3D view; never let a volume re-render (e.g.
+        # the debounced clip-timer, which calls _render_scene directly, bypassing
+        # update_view's guard) clobber it with the gray volume/isosurface.
+        if self._showing_surface and self._surface is not None:
+            self._render_surface(reset_camera=reset_camera)
+            return
         self.gl_view.clear()
         self._alignment_gl_items = []
         self._plane_items = []        # clear() removed them; _draw re-adds below
@@ -4239,6 +5216,253 @@ class SimpleAlignmentDialog(QDialog):
         super().closeEvent(event)
 
 
+# ── Geometry fitting (numpy-only least squares) ──────────────────────────────
+# These power the Geometry-based alignment. They use only numpy.linalg (never
+# scipy.linalg / scipy.optimize, which are excluded from the App Store bundle).
+
+def _axis_from_angles(th, ph):
+    st = math.sin(th)
+    return np.array([st * math.cos(ph), st * math.sin(ph), math.cos(th)], dtype=np.float64)
+
+
+def _angles_from_axis(a):
+    a = np.asarray(a, dtype=np.float64)
+    n = np.linalg.norm(a)
+    if n < 1e-12:
+        return 0.0, 0.0
+    a = a / n
+    th = math.acos(max(-1.0, min(1.0, a[2])))
+    ph = math.atan2(a[1], a[0])
+    return th, ph
+
+
+def _lm_fit(residual_fn, params0, iters=60):
+    """Levenberg–Marquardt least-squares with a finite-difference Jacobian
+    (numpy only). Returns (params, cost) or (None, inf) on failure."""
+    params = np.array(params0, dtype=np.float64)
+    r = residual_fn(params)
+    if r is None:
+        return None, float('inf')
+    cost = float(r @ r)
+    lam = 1e-3
+    eps = 1e-6
+    for _ in range(iters):
+        J = np.zeros((len(r), len(params)))
+        for k in range(len(params)):
+            dp = params.copy()
+            dp[k] += eps
+            rk = residual_fn(dp)
+            if rk is None:
+                return (params, cost)
+            J[:, k] = (rk - r) / eps
+        JTJ = J.T @ J
+        JTr = J.T @ r
+        improved = False
+        for _try in range(10):
+            try:
+                step = np.linalg.solve(JTJ + lam * (np.diag(np.diag(JTJ)) + 1e-12 * np.eye(len(params))), -JTr)
+            except np.linalg.LinAlgError:
+                lam *= 10.0
+                continue
+            new = params + step
+            rn = residual_fn(new)
+            if rn is not None and float(rn @ rn) < cost:
+                params, r, cost = new, rn, float(rn @ rn)
+                lam = max(lam * 0.5, 1e-12)
+                improved = True
+                break
+            lam *= 4.0
+        if not improved or np.linalg.norm(step) < 1e-9:
+            break
+    return params, cost
+
+
+def _fit_plane(pts):
+    """Best-fit plane → {'point', 'normal'} or None (needs ≥3 points)."""
+    pts = np.asarray(pts, dtype=np.float64)
+    if len(pts) < 3:
+        return None
+    c = pts.mean(axis=0)
+    try:
+        _, _, vt = np.linalg.svd(pts - c, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None
+    normal = vt[-1]
+    nn = np.linalg.norm(normal)
+    if nn < 1e-9:
+        return None
+    return {'type': 'plane', 'point': c, 'normal': normal / nn}
+
+
+def _fit_cylinder(pts):
+    """Least-squares cylinder → {'point' (on axis), 'axis', 'radius'} or None.
+    Needs ≥6 points. Multi-start over the principal directions to beat the
+    axis-orientation ambiguity."""
+    pts = np.asarray(pts, dtype=np.float64)
+    if len(pts) < 6:
+        return None
+    centroid = pts.mean(axis=0)
+    try:
+        _, _, vt = np.linalg.svd(pts - centroid, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None
+
+    def make_resid(c0):
+        def resid(p):
+            c = p[:3]
+            a = _axis_from_angles(p[3], p[4])
+            w = pts - c
+            t = w @ a
+            radial = w - np.outer(t, a)
+            dist = np.linalg.norm(radial, axis=1)
+            return dist - dist.mean()
+        return resid
+
+    best = None
+    for a0 in (vt[0], vt[1], vt[2]):
+        th, ph = _angles_from_axis(a0)
+        resid = make_resid(centroid)
+        params, cost = _lm_fit(resid, [centroid[0], centroid[1], centroid[2], th, ph])
+        if params is None:
+            continue
+        a = _axis_from_angles(params[3], params[4])
+        c = params[:3]
+        c = c - np.dot(c - centroid, a) * a   # anchor the axis point near the data
+        w = pts - c
+        t = w @ a
+        dist = np.linalg.norm(w - np.outer(t, a), axis=1)
+        r = float(dist.mean())
+        rms = float(np.sqrt(np.mean((dist - r) ** 2)))
+        if r > 1e-6 and np.isfinite(rms) and (best is None or rms < best['rms']):
+            best = {'type': 'cylinder', 'point': c, 'axis': a, 'radius': r, 'rms': rms}
+    return best
+
+
+def _fit_cone(pts):
+    """Least-squares cone → {'apex', 'axis', 'half_angle'} or None. Needs ≥6
+    points. ``axis`` points from the apex toward the open end."""
+    pts = np.asarray(pts, dtype=np.float64)
+    if len(pts) < 6:
+        return None
+    centroid = pts.mean(axis=0)
+    try:
+        _, _, vt = np.linalg.svd(pts - centroid, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None
+    extent = float(np.linalg.norm(pts - centroid, axis=1).max()) + 1e-6
+
+    def resid(p):
+        v = p[:3]
+        a = _axis_from_angles(p[3], p[4])
+        alpha = p[5]
+        if not (1e-3 < alpha < math.pi / 2 - 1e-3):
+            return None
+        w = pts - v
+        t = w @ a
+        m = np.linalg.norm(w - np.outer(t, a), axis=1)
+        # ~orthogonal distance to the cone surface
+        return m * math.cos(alpha) - t * math.sin(alpha)
+
+    best = None
+    for sgn in (1.0, -1.0):
+        a0 = sgn * vt[0]
+        th, ph = _angles_from_axis(a0)
+        # start the apex behind the data along the axis
+        v0 = centroid - a0 * extent
+        for alpha0 in (math.radians(20), math.radians(40)):
+            params, cost = _lm_fit(resid, [v0[0], v0[1], v0[2], th, ph, alpha0])
+            if params is None:
+                continue
+            r = resid(params)
+            if r is None:
+                continue
+            rms = float(np.sqrt(np.mean(r ** 2)))
+            a = _axis_from_angles(params[3], params[4])
+            # orient axis from apex toward the points
+            if np.dot(centroid - params[:3], a) < 0:
+                a = -a
+            alpha = float(params[5])
+            if np.isfinite(rms) and (best is None or rms < best['rms']):
+                best = {'type': 'cone', 'apex': params[:3].copy(),
+                        'axis': a, 'half_angle': alpha, 'rms': rms}
+    return best
+
+
+def _frame_from_z(z, x_hint):
+    """Right-handed frame (columns x, y, z) with the given z and an x as close
+    to ``x_hint`` as possible (projected into the plane ⊥ z)."""
+    z = np.asarray(z, dtype=np.float64)
+    z = z / np.linalg.norm(z)
+    x = np.asarray(x_hint, dtype=np.float64) - np.dot(x_hint, z) * z
+    if np.linalg.norm(x) < 1e-6:
+        alt = np.array([0.0, 1.0, 0.0]) if abs(z[0]) > 0.9 else np.array([1.0, 0.0, 0.0])
+        x = alt - np.dot(alt, z) * z
+    x = x / np.linalg.norm(x)
+    y = np.cross(z, x)
+    y = y / np.linalg.norm(y)
+    return np.column_stack([x, y, z]).astype(np.float64)
+
+
+def _geometry_alignment_transform(geom_type, fit, pts):
+    """Return (R, origin) for a geometry-based alignment, or None.
+
+    Z is the plane normal / cylinder axis / cone axis. For a plane the in-plane
+    X/Y come from the principal directions of the points projected onto the plane
+    (its oriented bounding box). For a cylinder/cone X/Y are derived from the
+    current object orientation (the world axis least parallel to Z), keeping the
+    rotation about the axis minimal."""
+    if fit is None:
+        return None
+    pts = np.asarray(pts, dtype=np.float64)
+    if geom_type == 'Plane':
+        z = np.asarray(fit['normal'], dtype=np.float64)
+        if z[2] < 0:                      # keep normal roughly toward +Z
+            z = -z
+        c = np.asarray(fit['point'], dtype=np.float64)
+        centered = pts - c
+        proj = centered - np.outer(centered @ z, z)
+        try:
+            _, _, vt = np.linalg.svd(proj, full_matrices=False)
+            x_hint = vt[0]
+        except np.linalg.LinAlgError:
+            x_hint = np.array([1.0, 0.0, 0.0])
+        R = _frame_from_z(z, x_hint)
+        origin = c
+    elif geom_type == 'Cylinder':
+        z = np.asarray(fit['axis'], dtype=np.float64)
+        if z[2] < 0:
+            z = -z
+        x_hint = np.array([0.0, 1.0, 0.0]) if abs(z[0]) > 0.9 else np.array([1.0, 0.0, 0.0])
+        R = _frame_from_z(z, x_hint)
+        c = np.asarray(fit['point'], dtype=np.float64)
+        origin = c + np.dot(pts.mean(axis=0) - c, z) * z   # axis point nearest the data
+    elif geom_type == 'Cone':
+        z = np.asarray(fit['axis'], dtype=np.float64)
+        if z[2] < 0:
+            z = -z
+        x_hint = np.array([0.0, 1.0, 0.0]) if abs(z[0]) > 0.9 else np.array([1.0, 0.0, 0.0])
+        R = _frame_from_z(z, x_hint)
+        origin = np.asarray(fit['apex'], dtype=np.float64)   # apex is the natural origin
+    else:
+        return None
+    if not np.all(np.isfinite(R)) or not np.all(np.isfinite(origin)):
+        return None
+    return R, origin
+
+
+_GEOM_MIN_POINTS = {'Plane': 3, 'Cylinder': 6, 'Cone': 6}
+
+
+def _fit_geometry(geom_type, pts):
+    if geom_type == 'Plane':
+        return _fit_plane(pts)
+    if geom_type == 'Cylinder':
+        return _fit_cylinder(pts)
+    if geom_type == 'Cone':
+        return _fit_cone(pts)
+    return None
+
+
 def _compute_321_transform(plane_pts, line_pts, origin_pt):
     """Return (R, origin) for 3-2-1 alignment, or None if degenerate."""
     p0, p1, p2 = plane_pts.astype(np.float64)
@@ -4410,6 +5634,180 @@ class AlignmentDialog321(QDialog):
         return list(self.points)
 
 
+class GeometryAlignmentDialog(QDialog):
+    """Non-modal Geometry-based alignment dialog: pick points on a Plane,
+    Cylinder, or Cone surface; a Gauss (least-squares) fit drives the alignment.
+    The fit/preview/Apply-enabled state is managed by MainWindow."""
+
+    _PICK_KEY = '⌘+click' if sys.platform == 'darwin' else 'Ctrl+click'
+    _MAX_POINTS = 50
+
+    geometry_changed = Signal(str)
+    reset_requested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Geometry-based Alignment')
+        self.setWindowFlags(Qt.Tool | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
+        self.setModal(False)
+        self.points = []
+        self._setup_ui()
+        self._refresh()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel('Geometry:'))
+        self.geom_combo = QComboBox()
+        self.geom_combo.addItems(['Plane', 'Cylinder', 'Cone'])
+        self.geom_combo.currentTextChanged.connect(self._on_geom_changed)
+        row.addWidget(self.geom_combo, 1)
+        layout.addLayout(row)
+
+        self._instruction = QLabel()
+        self._instruction.setWordWrap(True)
+        self._instruction.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self._instruction)
+
+        self._status = QLabel()
+        self._status.setAlignment(Qt.AlignCenter)
+        sfont = self._status.font()
+        sfont.setBold(True)
+        self._status.setFont(sfont)
+        layout.addWidget(self._status)
+
+        layout.addSpacing(4)
+        btn_row = QHBoxLayout()
+        self._reset_btn = QPushButton('Reset')
+        self._reset_btn.clicked.connect(self._on_reset)
+        btn_row.addWidget(self._reset_btn)
+        self._apply_btn = QPushButton('Apply')
+        self._apply_btn.setDefault(True)
+        self._apply_btn.setEnabled(False)
+        self._apply_btn.clicked.connect(self.accept)
+        btn_row.addWidget(self._apply_btn)
+        cancel_btn = QPushButton('Cancel')
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+        self.setMinimumWidth(330)
+
+    def geometry(self):
+        return self.geom_combo.currentText()
+
+    def _on_geom_changed(self, text):
+        # Picked points are kept; MainWindow refits for the new geometry.
+        self._refresh()
+        self.geometry_changed.emit(text)
+
+    def add_point(self, point):
+        if len(self.points) >= self._MAX_POINTS:
+            return
+        self.points.append(point)
+        self._refresh()
+
+    def _on_reset(self):
+        self.points = []
+        self._refresh()
+        self.reset_requested.emit()
+
+    def get_points(self):
+        return list(self.points)
+
+    def set_apply_enabled(self, ok):
+        self._apply_btn.setEnabled(bool(ok))
+
+    def set_fit_status(self, text):
+        self._status.setText(text)
+
+    def _refresh(self):
+        g = self.geometry()
+        need = _GEOM_MIN_POINTS.get(g, 3)
+        self._instruction.setText(
+            f'{self._PICK_KEY} points on the {g.lower()} surface in the 3D view '
+            f'(at least {need}, up to {self._MAX_POINTS}).\n{len(self.points)} placed.')
+
+
+# Surface resolution presets → downsample factor per axis.
+_SURFACE_PRESETS = {'High': 1, 'Medium': 2, 'Low': 4}
+_SURFACE_COLOR = (0.78, 0.88, 1.0, 1.0)   # very light blue
+
+
+def _write_stl(path, verts, faces):
+    """Write a binary STL file from vertices + triangle faces (numpy only)."""
+    verts = np.asarray(verts, dtype=np.float32)
+    faces = np.asarray(faces, dtype=np.int64)
+    tris = verts[faces]                                  # (N, 3, 3)
+    v0, v1, v2 = tris[:, 0], tris[:, 1], tris[:, 2]
+    normals = np.cross(v1 - v0, v2 - v0)
+    nlen = np.linalg.norm(normals, axis=1, keepdims=True)
+    normals = np.divide(normals, nlen, out=np.zeros_like(normals),
+                        where=nlen > 0).astype(np.float32)
+    n = int(tris.shape[0])
+    rec = np.zeros(n, dtype=np.dtype([('n', '<f4', (3,)),
+                                      ('v', '<f4', (3, 3)),
+                                      ('a', '<u2')]))
+    rec['n'] = normals
+    rec['v'] = tris.astype(np.float32)
+    with open(path, 'wb') as f:
+        f.write(b'Voxels Viewer'.ljust(80, b'\x00'))
+        f.write(np.array([n], dtype='<u4').tobytes())
+        f.write(rec.tobytes())
+
+
+def _read_stl(path):
+    """Read a binary STL into (verts, faces). Each triangle keeps its own three
+    vertices (no shared-vertex dedup), which is fine for display. Returns None
+    if the file is missing or malformed."""
+    try:
+        with open(path, 'rb') as f:
+            f.seek(80)
+            head = f.read(4)
+            if len(head) < 4:
+                return None
+            n = int(np.frombuffer(head, dtype='<u4')[0])
+            data = f.read(n * 50)
+        if n == 0 or len(data) < n * 50:
+            return None
+        rec = np.frombuffer(data, count=n, dtype=np.dtype(
+            [('n', '<f4', (3,)), ('v', '<f4', (3, 3)), ('a', '<u2')]))
+        verts = rec['v'].reshape(-1, 3).astype(np.float32)
+        faces = np.arange(n * 3, dtype=np.int64).reshape(n, 3)
+        return verts, faces
+    except Exception:
+        return None
+
+
+class SurfaceCreationDialog(QDialog):
+    """Pick a resolution preset for the surface mesh built from the isovalue."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Create Surface')
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel('Resolution preset:'))
+        self.combo = QComboBox()
+        self.combo.addItems(['Low', 'Medium', 'High'])
+        self.combo.setCurrentText('Medium')
+        layout.addWidget(self.combo)
+        hint = QLabel('High ≈ one vertex per surface voxel.\n'
+                      'Medium and Low use ~2× and ~4× fewer vertices per axis.')
+        hint.setStyleSheet('color: gray;')
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.setMinimumWidth(320)
+
+    def preset(self):
+        return self.combo.currentText()
+
+
 def _dtype_label(dt) -> str:
     """Human-readable data type, e.g. '16-bit int', '32-bit float'."""
     dt = np.dtype(dt)
@@ -4427,6 +5825,42 @@ def _format_bytes(nbytes: int) -> str:
     if nbytes >= 1024 ** 3:
         return f'{nbytes / 1024 ** 3:.2f} GB'
     return f'{nbytes / 1024 ** 2:.1f} MB'
+
+
+def _suggest_isovalue_percent(histogram, bin_edges):
+    """Suggest an isovalue, as a 0–100% position over the data range, placed
+    midway between the two largest histogram peaks (typically the air and the
+    material modes of a CT scan). Returns an int percent, or None if two peaks
+    can't be identified."""
+    if histogram is None or bin_edges is None:
+        return None
+    counts = np.asarray(histogram, dtype=np.float64)
+    edges = np.asarray(bin_edges, dtype=np.float64)
+    if counts.size < 4 or edges.size != counts.size + 1:
+        return None
+    # Light smoothing so noise doesn't masquerade as peaks.
+    k = np.array([1.0, 2.0, 3.0, 2.0, 1.0])
+    k /= k.sum()
+    sm = np.convolve(counts, k, mode='same')
+    n = sm.size
+    # Local maxima (interior + endpoints).
+    peaks = [i for i in range(1, n - 1)
+             if sm[i] >= sm[i - 1] and sm[i] >= sm[i + 1] and sm[i] > 0]
+    if sm[0] > sm[1]:
+        peaks.append(0)
+    if sm[-1] > sm[-2]:
+        peaks.append(n - 1)
+    if len(peaks) < 2:
+        return None
+    peaks.sort(key=lambda i: sm[i], reverse=True)
+    p1, p2 = peaks[0], peaks[1]
+    centers = (edges[:-1] + edges[1:]) / 2.0
+    mid = 0.5 * (centers[p1] + centers[p2])
+    lo, hi = float(edges[0]), float(edges[-1])
+    if hi - lo < 1e-9:
+        return None
+    pct = (mid - lo) / (hi - lo) * 100.0
+    return int(round(min(100.0, max(0.0, pct))))
 
 
 class HistogramView(QWidget):
@@ -4566,6 +6000,12 @@ class MainWindow(QMainWindow):
         self.volume_data = VolumeData()
         self.preferences = _load_prefs()
         self._alignment_dialog = None
+        self._geom_align_dialog = None   # Geometry-based alignment dialog
+        self._geom_fit = None            # cached fit for the active geometry dialog
+        self._surfaces = []              # created surface meshes (under Volume)
+        self._surface_counter = 0
+        self._project_meshes = []        # meshes promoted to top-level tree objects
+        self._active_surface_rec = None  # surface record currently shown in 3D
         self._sync_locked = bool(self.preferences.get('sync_locked', True))
         self._syncing = False
         # In unlocked mode only the most-recently-moved slider's coordinate
@@ -4602,7 +6042,7 @@ class MainWindow(QMainWindow):
         # holding its absolute input→display transform; one is always active.
         self._alignments = []
         self._active_alignment = 0
-        self._align_counters = {'simple': 0, '321': 0}
+        self._align_counters = {'simple': 0, '321': 0, 'geometry': 0}
         # Persistent measurements (project tree "Measurements"). Each record is a
         # dict with kind/orientation/slice/alignment/points/view_range/graphic;
         # the graphic exists only while the measurement is on its visible slice.
@@ -4728,6 +6168,14 @@ class MainWindow(QMainWindow):
         self.project_tree.grayvalue_activate_requested.connect(self._goto_gray_value)
         self.project_tree.grayvalue_remove_requested.connect(self._remove_gray_value)
         self.project_tree.grayvalue_export_requested.connect(self._export_gray_value)
+        self.project_tree.create_surface_requested.connect(self.open_create_surface)
+        self.project_tree.surface_activate_requested.connect(self._goto_surface)
+        self.project_tree.surface_remove_requested.connect(self._remove_surface)
+        self.project_tree.surface_export_stl_requested.connect(self._export_surface_stl)
+        self.project_tree.surface_promote_requested.connect(self._promote_surface)
+        self.project_tree.projectmesh_activate_requested.connect(self._show_project_mesh)
+        self.project_tree.projectmesh_export_stl_requested.connect(self._export_project_mesh_stl)
+        self.project_tree.projectmesh_remove_requested.connect(self._remove_project_mesh)
         self.project_tree.set_volume_name(self._volume_name)
 
         self.left_splitter = QtWidgets.QSplitter(Qt.Vertical)
@@ -4792,6 +6240,10 @@ class MainWindow(QMainWindow):
 
         # 3D render mode / isovalue changes count as project changes.
         self.view_3d.mode_combo.currentTextChanged.connect(lambda *_: self._mark_dirty())
+        # Show the surface's 2D slice-outline only while the Surface Mesh renderer
+        # is active (runs after view_3d.on_mode_changed has updated the state).
+        self.view_3d.mode_combo.currentTextChanged.connect(
+            lambda *_: self._refresh_surface_outline())
         self.view_3d.iso_slider.valueChanged.connect(lambda *_: self._mark_dirty())
 
         # 2D toggle: coordinate lines in the 2D viewports (linked across them).
@@ -4826,6 +6278,14 @@ class MainWindow(QMainWindow):
             lambda axis, idx, total, sv=self.view_yz: self._on_axis_position_changed(sv, axis, idx, total))
         self.view_xz.axis_position_changed.connect(
             lambda axis, idx, total, sv=self.view_xz: self._on_axis_position_changed(sv, axis, idx, total))
+
+        # Slice-video recording: one recorder at a time; the other two viewports
+        # show the chosen range's two endpoints as coordinate lines.
+        for v in (self.view_xy, self.view_yz, self.view_xz):
+            v.record_mode_changed.connect(
+                lambda on, sv=v: self._on_record_mode_changed(sv, on))
+            v.record_range_changed.connect(
+                lambda lo, hi, total, sv=v: self._on_record_range_changed(sv, lo, hi, total))
 
         meas_tool = self.preferences.get('measurement_tool', 'distance')
         for sv in (self.view_xy, self.view_yz, self.view_xz):
@@ -4907,12 +6367,19 @@ class MainWindow(QMainWindow):
         simple_align.triggered.connect(self.open_simple_alignment)
         point_align = QtWidgets.QAction('3-2-1 Alignment...', self)
         point_align.triggered.connect(self.open_point_alignment)
+        geom_align = QtWidgets.QAction('Geometry-based Alignment...', self)
+        geom_align.triggered.connect(self.open_geometry_alignment)
         reset_align = QtWidgets.QAction('Reset Alignment', self)
         reset_align.triggered.connect(self.reset_alignment)
         alignment_menu.addAction(simple_align)
         alignment_menu.addAction(point_align)
+        alignment_menu.addAction(geom_align)
         alignment_menu.addSeparator()
         alignment_menu.addAction(reset_align)
+        operations_menu.addSeparator()
+        surface_action = QtWidgets.QAction('Create Surface...', self)
+        surface_action.triggered.connect(self.open_create_surface)
+        operations_menu.addAction(surface_action)
         operations_menu.addSeparator()
         volume_info_action = QtWidgets.QAction('Volume Information...', self)
         volume_info_action.triggered.connect(self.open_volume_information)
@@ -4969,6 +6436,19 @@ class MainWindow(QMainWindow):
         pip._quality       = src._quality
         pip._display_levels = src._display_levels
         pip.iso_threshold_percent = src.iso_threshold_percent
+        # Mirror the Surface Mesh renderer too (otherwise the PiP falls back to
+        # Phong). _render_surface places the mesh relative to the render frame, so
+        # those fields must be copied before update_view (which early-returns for
+        # a surface and would otherwise leave them stale).
+        pip._showing_surface = src._showing_surface
+        pip._surface       = src._surface
+        pip._surface_shape = src._surface_shape
+        pip._surface_color = src._surface_color
+        pip._render_volume = src._render_volume
+        pip._render_shape  = src._render_shape
+        pip._render_factor = src._render_factor
+        pip._render_vol_min = getattr(src, '_render_vol_min', 0.0)
+        pip._render_vol_max = getattr(src, '_render_vol_max', 1.0)
         pip.update_view()
         # Lock the camera to the maximized viewport's orientation.
         az, el = self._PIP_CAMERA.get(viewer.orientation, (-45.0, 30.0))
@@ -5149,7 +6629,9 @@ class MainWindow(QMainWindow):
         self._reset_alignments()
         self._reset_measurements()
         self._reset_gray_values()
+        self._reset_surfaces()
         self.update_views()
+        self._auto_set_isovalue()
         self._start_new_project()
 
     def import_volume(self):
@@ -5198,7 +6680,9 @@ class MainWindow(QMainWindow):
         self._reset_alignments()
         self._reset_measurements()
         self._reset_gray_values()
+        self._reset_surfaces()
         self.update_views()
+        self._auto_set_isovalue()
         self._start_new_project()
 
     # ── Project save / open ───────────────────────────────────────────────────
@@ -5251,6 +6735,10 @@ class MainWindow(QMainWindow):
             return {'slice': viewer.current_index,
                     'view_range': [list(xr), list(yr)]}
 
+        # Persist surface meshes as STL files alongside the .voxels project and
+        # reference them from the JSON (geometry is not inlined into the JSON).
+        surface_entries, mesh_entries = self._serialize_meshes(path)
+
         panel = self.left_panel
         # Store the single cumulative view-time alignment (output→input affine).
         align = None
@@ -5280,6 +6768,8 @@ class MainWindow(QMainWindow):
             'active_alignment': self._active_alignment,
             'measurements': [self._serialize_measurement(r) for r in self._measurements],
             'gray_values': [self._serialize_gray_value(r) for r in self._gray_values],
+            'surfaces': surface_entries,
+            'project_meshes': mesh_entries,
             'sync_locked': self._sync_locked,
             'render': {
                 'mode': self.view_3d.mode,
@@ -5363,6 +6853,7 @@ class MainWindow(QMainWindow):
         self._restore_alignments(project)
         self._restore_measurements(project)
         self._restore_gray_values(project)
+        self._reset_surfaces()   # clear the previous project's surfaces
 
         self.update_views()
 
@@ -5394,6 +6885,12 @@ class MainWindow(QMainWindow):
         if saved_lock != self._sync_locked:
             self._on_lock_clicked(self.view_xy)
 
+        # Restore surface meshes from the STLs saved beside the project. Must
+        # come after update_views() (so the 3D render shape is set for placement)
+        # and before the render-mode restore below (so the 'Surface Mesh' renderer
+        # is available if the project was saved in that mode).
+        self._restore_meshes(project, project_dir)
+
         # Restore 3D render mode and isovalue
         render = project.get('render', {})
         if 'iso_threshold_percent' in render:
@@ -5411,6 +6908,24 @@ class MainWindow(QMainWindow):
         self._project_path = path
         self._dirty = False
         self._update_title()
+
+        # A surface mesh built during the synchronous open can paint as a blocky
+        # artifact ("a weird cube") because the 3D GL context isn't fully current
+        # yet — the user otherwise has to toggle the renderer to force a clean
+        # rebuild. Do that toggle automatically once the event loop is running and
+        # the GL view has been shown/painted, keeping the restored camera.
+        if self.view_3d._showing_surface:
+            QtCore.QTimer.singleShot(0, self._rerender_restored_surface)
+
+    def _rerender_restored_surface(self):
+        """Rebuild the surface mesh in a now-valid GL context (see open_voxels_project)."""
+        v3 = self.view_3d
+        if not (v3._showing_surface and v3._surface is not None):
+            return
+        v3._set_render_frame(v3._surface_render_voxels())
+        v3._render_surface(reset_camera=False)
+        v3.gl_view.update()
+        self._refresh_surface_outline()
 
     def _load_volume_from_source(self, src, project_dir, on_progress=None):
         """Load a volume from a project source dict. Returns (ndarray, voxel_size)."""
@@ -5633,6 +7148,15 @@ class MainWindow(QMainWindow):
             print('Image load error:', exc)
             return None
 
+    def _auto_set_isovalue(self):
+        """On import, guess a good 3D isovalue from the histogram — midway between
+        its two largest peaks (air vs material) — and set the slider to it."""
+        pct = _suggest_isovalue_percent(
+            getattr(self.volume_data, 'histogram', None),
+            getattr(self.volume_data, 'bin_edges', None))
+        if pct is not None:
+            self.view_3d.iso_slider.setValue(int(pct))
+
     def update_views(self):
         self.view_xy.set_volume(self.volume_data)
         self.view_yz.set_volume(self.volume_data)
@@ -5668,10 +7192,12 @@ class MainWindow(QMainWindow):
         for viewer in (self.view_xy, self.view_yz, self.view_xz):
             viewer.set_levels(min_val, max_val)   # fast LUT update, no re-slice
         self.view_3d.set_levels(min_val, max_val)
-        # The isosurface ignores the window; only the Phong volume needs a
-        # re-render, and that's expensive — debounce it so it runs once the user
-        # stops dragging rather than on every slider tick.
-        if self.view_3d.mode != 'Isosurface':
+        # Only the Phong volume render depends on the window. The isosurface and
+        # a created Surface Mesh both ignore it entirely, so re-rendering them on
+        # a window change is pure wasted work — and rebuilding a large surface
+        # mesh on every Auto Min Max tick makes the UI crawl. Re-render (debounced)
+        # only when the Phong volume is actually on screen.
+        if self.view_3d.mode != 'Isosurface' and not self.view_3d._showing_surface:
             self._levels_timer.start(200)
 
     def open_preferences(self):
@@ -5782,6 +7308,28 @@ class MainWindow(QMainWindow):
             if sv is not None:
                 viewers.append(sv)
         return viewers
+
+    # ── Slice-video record coordination ───────────────────────────────────────
+    _RECORD_AXIS = {'XY': 'Z', 'YZ': 'X', 'XZ': 'Y'}
+
+    def _on_record_mode_changed(self, source, on):
+        """Enforce a single recorder and refresh the range lines on the others."""
+        if on:
+            for sv in self._slice_viewers():
+                if sv is not source and sv._record_mode:
+                    sv.set_record_mode(False)
+        else:
+            for sv in self._slice_viewers():
+                sv.clear_record_lines()
+
+    def _on_record_range_changed(self, source, low, high, total):
+        """Show the recording viewport's range as two lines on the other two."""
+        axis = self._RECORD_AXIS.get(source.orientation)
+        for sv in self._slice_viewers():
+            if sv is source:
+                sv.clear_record_lines()
+            elif axis is not None:
+                sv.show_record_lines(axis, low, high, total)
 
     def _display_shape(self):
         """Dimensions of the frame currently shown in the slice viewers.
@@ -5974,26 +7522,51 @@ class MainWindow(QMainWindow):
                                               viewer.orientation, vol_shape)
                 viewer.show_axis_line(axis, index, total, seg)
 
+    _LOCK_SYNC_MS = 50   # throttle for the heavy locked-mode cross-viewport sync
+
     def _on_viewport_range_changed(self, source_viewer):
         # Re-entrant range changes (from _center_all_on_intersection during a
         # sync) are ignored — _do_lock_sync handles everything in one pass.
         if self._syncing:
             return
         self._mark_dirty()
-        if self._sync_locked:
-            # Locked: re-slicing + re-centering the other viewports is the costly
-            # part and a pan drag fires far more events than the display can use.
-            # Defer ALL cross-viewport work to a throttled tick (~30 Hz): run once
-            # immediately (leading edge) and once after the drag settles, so the
-            # panned viewport itself stays fully responsive in between.
-            self._pending_lock_source = source_viewer
-            if not self._lock_sync_timer.isActive():
-                self._do_lock_sync()
-                self._lock_sync_timer.start(33)
+        # Cheap, live, every event (locked or not): the source viewport's
+        # crosshair line across the viewports + the 3D coordinate planes. This is
+        # the same light work unlocked mode does, so the panned viewport stays as
+        # responsive as in unlocked mode.
+        self._update_range_overlays(source_viewer, restart_hide=not self._sync_locked)
+        if not self._sync_locked:
             return
-        # Unlocked: light per-event overlays only (no slice sync). Surface this
-        # viewport's coordinate line in the others + (re)start the auto-hide.
-        self._update_range_overlays(source_viewer, restart_hide=True)
+        # Locked: keep the panned viewport's own crosshair pinned to the view
+        # centre live (cheap), so it doesn't lag behind the pan while the heavier
+        # orthogonal re-slice/re-centre runs on a throttled timer off this path.
+        self._update_source_crosshair_live(source_viewer)
+        self._pending_lock_source = source_viewer
+        if not self._lock_sync_timer.isActive():
+            self._lock_sync_timer.start(self._LOCK_SYNC_MS)
+
+    def _update_source_crosshair_live(self, sv):
+        """Position the panned viewport's two crosshair lines at its current view
+        centre (locked mode), tracking the pan continuously rather than waiting
+        for the throttled slice re-sync."""
+        shape = self._display_shape()
+        if shape is None:
+            return
+        nx, ny, nz = shape
+        (x0, x1), (y0, y1) = sv.image_view.getView().getViewBox().viewRange()
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        # Vertical line at plot-x = cx; horizontal line at plot-y = cy; segments
+        # span the visible viewport so it reads as a full centred crosshair.
+        if sv.orientation == 'XY':
+            sv.show_axis_line('X', cx, nx, (y0, y1))
+            sv.show_axis_line('Y', ny - 1 - cy, ny, (x0, x1))
+        elif sv.orientation == 'YZ':
+            sv.show_axis_line('Y', cx, ny, (y0, y1))
+            sv.show_axis_line('Z', nz - 1 - cy, nz, (x0, x1))
+        elif sv.orientation == 'XZ':
+            sv.show_axis_line('X', cx, nx, (y0, y1))
+            sv.show_axis_line('Z', nz - 1 - cy, nz, (x0, x1))
 
     def _update_range_overlays(self, source_viewer, restart_hide=False):
         """Show this viewport's coordinate line across the viewports and refresh
@@ -6032,7 +7605,7 @@ class MainWindow(QMainWindow):
             xr, yr = src_range
             W, H = xr[1] - xr[0], yr[1] - yr[0]
             self._sync_slices_to_center(sv, src_range)
-            self._center_all_on_intersection(W, H)
+            self._center_all_on_intersection(W, H, exclude=sv)
         finally:
             self._syncing = False
         # Overlays whose extent tracks the view (cheap) refresh every tick.
@@ -6040,18 +7613,27 @@ class MainWindow(QMainWindow):
         self._update_coord_planes()
         if isinstance(self.maximized_widget, SliceViewer):
             self._update_pip_plane()
-        # Slice-dependent work (clips, measurements, gray-value tools) only when a
-        # slice actually changed. Pure pan/zoom that doesn't cross a slice must
-        # NOT rebuild these — rebuilding the ROI graphics every tick made pan and
-        # zoom sluggish whenever the project had measurements/gray-value tools.
-        if (self.view_xy.current_index, self.view_yz.current_index,
-                self.view_xz.current_index) != before:
+        # Re-sync measurements / gray tools ONLY for the viewports whose slice
+        # actually changed. Rebuilding ROI graphics is expensive, so never touch
+        # the source viewport (its slice doesn't change during its own in-plane
+        # pan) or any viewport that didn't move — that churn was the main cause
+        # of locked-mode pan sluggishness with measurements present.
+        after = (self.view_xy.current_index, self.view_yz.current_index,
+                 self.view_xz.current_index)
+        changed = [v for v, b, a in zip((self.view_xy, self.view_yz, self.view_xz),
+                                        before, after) if b != a]
+        if changed:
             self._update_clips()
-            self._sync_measurements()
-            self._sync_gray()
+            for v in changed:
+                self._sync_measurements_for(v)
+                self._sync_gray_for(v)
 
-    def _center_all_on_intersection(self, W, H):
-        """Set every locked viewport's range to W×H centered on its own line intersection.
+    def _center_all_on_intersection(self, W, H, exclude=None):
+        """Set every locked viewport's range to W×H centered on its own line
+        intersection. ``exclude`` skips a viewport — used to leave the viewport
+        the user is actively panning untouched (re-ranging it mid-drag fights
+        pyqtgraph's own pan handling and makes panning feel sluggish; it is
+        already at the right place, since the crosshair is derived from it).
 
         Intersection plot coords (each viewport's horizontal axis = raw, vertical = flipped):
           XY: (x=x_idx, y=ny-1-y_idx)   — X-line × Y-line
@@ -6072,6 +7654,8 @@ class MainWindow(QMainWindow):
             self.view_xz: (x_idx,        nz - 1 - z_idx),
         }
         for viewer, (cx, cy) in centers.items():
+            if viewer is exclude:
+                continue
             viewer.image_view.getView().getViewBox().setRange(
                 xRange=(cx - hw, cx + hw), yRange=(cy - hh, cy + hh), padding=0)
 
@@ -6183,6 +7767,68 @@ class MainWindow(QMainWindow):
         R, origin = result_transform
         self._apply_321(R, origin)
 
+    def open_geometry_alignment(self):
+        if not self.volume_data.is_loaded():
+            QMessageBox.warning(self, 'Geometry-based Alignment',
+                                'Please import a volume first.')
+            return
+        if self._geom_align_dialog is not None:
+            self._geom_align_dialog.raise_()
+            return
+        dlg = GeometryAlignmentDialog(self)
+        self._geom_align_dialog = dlg
+        self.view_3d.set_alignment_mode(True)
+        dlg.reset_requested.connect(self._on_geom_align_changed)
+        dlg.geometry_changed.connect(lambda *_: self._on_geom_align_changed())
+        dlg.finished.connect(self._on_geom_align_finished)
+        dlg.show()
+        dlg.raise_()
+        self._on_geom_align_changed()
+
+    def _on_geom_align_changed(self):
+        """Refit the selected geometry to the picked points, update the 3D
+        preview, and enable Apply only when the fit succeeds."""
+        dlg = self._geom_align_dialog
+        if dlg is None:
+            return
+        pts = dlg.get_points()
+        g = dlg.geometry()
+        need = _GEOM_MIN_POINTS.get(g, 3)
+        fit = _fit_geometry(g, pts) if len(pts) >= need else None
+        self._geom_fit = fit
+        self.view_3d.set_geometry_overlay(pts, g, fit)
+        if len(pts) < need:
+            dlg.set_fit_status(f'Need at least {need} points for a {g.lower()} fit.')
+            dlg.set_apply_enabled(False)
+        elif fit is None:
+            dlg.set_fit_status('Fit failed — add more or better-spread points.')
+            dlg.set_apply_enabled(False)
+        else:
+            rms = fit.get('rms')
+            extra = f'   (RMS {rms:.2f} vox)' if rms is not None else ''
+            dlg.set_fit_status(f'{g} fit ✓{extra}')
+            dlg.set_apply_enabled(True)
+
+    def _on_geom_align_finished(self, result):
+        dlg = self._geom_align_dialog
+        self._geom_align_dialog = None
+        self._geom_fit = None
+        self.view_3d.set_alignment_mode(False)
+        self.view_3d.clear_alignment_overlays()
+        if result != QDialog.Accepted or dlg is None:
+            return
+        pts = dlg.get_points()
+        g = dlg.geometry()
+        fit = _fit_geometry(g, pts)
+        tf = (_geometry_alignment_transform(g, fit, np.array(pts, dtype=np.float64))
+              if fit is not None else None)
+        if tf is None:
+            QMessageBox.warning(self, 'Geometry-based Alignment',
+                                'Could not compute an alignment from the picked points.')
+            return
+        R, origin = tf
+        self._apply_new_alignment(R, origin, 'Geometry-based Alignment', kind='geometry')
+
     # ── Alignment history (project tree) ──────────────────────────────────────
     def _reset_alignments(self):
         """Start a fresh history with just the Initial Alignment (active)."""
@@ -6191,7 +7837,7 @@ class MainWindow(QMainWindow):
             'R': None, 'offset': None, 'out_shape': None,
         }]
         self._active_alignment = 0
-        self._align_counters = {'simple': 0, '321': 0}
+        self._align_counters = {'simple': 0, '321': 0, 'geometry': 0}
         self._refresh_alignment_tree()
 
     def _refresh_alignment_tree(self):
@@ -6202,7 +7848,8 @@ class MainWindow(QMainWindow):
     def _record_alignment(self, kind):
         """Snapshot the just-applied cumulative transform as a new history entry
         and make it the active one."""
-        labels = {'simple': 'Simple Alignment', '321': '3-2-1 Alignment'}
+        labels = {'simple': 'Simple Alignment', '321': '3-2-1 Alignment',
+                  'geometry': 'Geometry Alignment'}
         self._align_counters[kind] = self._align_counters.get(kind, 0) + 1
         rec = {
             'name': f"{labels.get(kind, 'Alignment')} {self._align_counters[kind]}",
@@ -6219,10 +7866,13 @@ class MainWindow(QMainWindow):
 
     def _show_raw_alignment(self):
         """Drop the view-time alignment and show the raw (Initial) volume."""
+        old_R, old_offset = self._align_R, self._align_offset
         self._reset_alignment_state()
         for sv in self._slice_viewers():
             sv.clear_permanent_transform()
         self.view_3d.clear_permanent_volume()
+        # Carry the child surface meshes back into the raw (Initial) frame.
+        self._remap_surfaces(old_R, old_offset)
         self.update_views()
 
     def _activate_alignment(self, index):
@@ -6313,7 +7963,7 @@ class MainWindow(QMainWindow):
                     'out_shape': tuple(a['out_shape']) if a.get('out_shape') is not None else None,
                 })
             self._active_alignment = int(project.get('active_alignment', 0))
-            self._align_counters = {'simple': 0, '321': 0}
+            self._align_counters = {'simple': 0, '321': 0, 'geometry': 0}
             for a in self._alignments:
                 if a['kind'] in self._align_counters:
                     self._align_counters[a['kind']] += 1
@@ -6322,7 +7972,7 @@ class MainWindow(QMainWindow):
                 'name': 'Initial Alignment', 'kind': 'initial',
                 'R': None, 'offset': None, 'out_shape': None,
             }]
-            self._align_counters = {'simple': 0, '321': 0}
+            self._align_counters = {'simple': 0, '321': 0, 'geometry': 0}
             if self._align_active:
                 self._align_counters['simple'] = 1
                 self._alignments.append({
@@ -6602,6 +8252,274 @@ class MainWindow(QMainWindow):
                 self._gray_counter[kind] += 1
         self._refresh_gray_tree()
 
+    # ── Surfaces (project tree) ───────────────────────────────────────────────
+    def _reset_surfaces(self):
+        self._surfaces = []
+        self._project_meshes = []
+        self._surface_counter = 0
+        self._active_surface_rec = None
+        self.view_3d.clear_surface()
+        self._refresh_surface_tree()
+        self._refresh_project_meshes_tree()
+        self._refresh_surface_outline()
+
+    def _serialize_meshes(self, project_path):
+        """Write each surface / project mesh as a binary STL next to the project
+        file and return (surfaces, project_meshes) lists of JSON-safe entries that
+        reference those files. Geometry lives in the STLs, not the .voxels JSON."""
+        project_dir = os.path.dirname(os.path.abspath(project_path))
+        base = os.path.splitext(os.path.basename(project_path))[0]
+
+        def dump(records, suffix):
+            entries = []
+            for i, rec in enumerate(records):
+                fname = f'{base}_{suffix}_{i + 1}.stl'
+                try:
+                    _write_stl(os.path.join(project_dir, fname),
+                               rec['verts'], rec['faces'])
+                except Exception:
+                    continue
+                shape = rec.get('shape')
+                entries.append({
+                    'name': rec.get('name', 'Surface'), 'file': fname,
+                    'preset': rec.get('preset'), 'level': rec.get('level'),
+                    'shape': list(shape) if shape is not None else None,
+                })
+            return entries
+
+        return dump(self._surfaces, 'surface'), dump(self._project_meshes, 'mesh')
+
+    def _restore_meshes(self, project, project_dir):
+        """Reload surfaces / project meshes from the STLs saved beside the
+        project, rebuild the tree, and show the last surface in 3D."""
+        self._surfaces = []
+        self._project_meshes = []
+        self._surface_counter = 0
+
+        def load(entries):
+            recs = []
+            for entry in entries or []:
+                fname = entry.get('file')
+                if not fname:
+                    continue
+                mesh = _read_stl(os.path.join(project_dir, fname))
+                if mesh is None:
+                    continue
+                verts, faces = mesh
+                shape = entry.get('shape')
+                recs.append({
+                    'name': entry.get('name', 'Surface'),
+                    'verts': verts, 'faces': faces,
+                    'preset': entry.get('preset'), 'level': entry.get('level'),
+                    'shape': tuple(shape) if shape is not None else None,
+                })
+            return recs
+
+        self._surfaces = load(project.get('surfaces'))
+        self._project_meshes = load(project.get('project_meshes'))
+        self._surface_counter = len(self._surfaces)
+        self._refresh_surface_tree()
+        self._refresh_project_meshes_tree()
+        if self._surfaces:
+            self._show_surface_in_3d(self._surfaces[-1])
+        else:
+            self.view_3d.clear_surface()
+            self._refresh_surface_outline()
+
+    def _refresh_surface_tree(self):
+        self.project_tree.set_surfaces([{'name': s['name']} for s in self._surfaces])
+        # 'Surface Mesh' renderer is only offered while a surface exists.
+        self.view_3d.set_surface_available(len(self._surfaces) > 0)
+
+    def _refresh_project_meshes_tree(self):
+        self.project_tree.set_project_meshes(
+            [{'name': m['name']} for m in self._project_meshes])
+
+    def _save_mesh_stl(self, rec):
+        """Prompt for a path and write ``rec``'s mesh as a binary STL."""
+        default = (rec.get('name') or 'surface').replace(' ', '_') + '.stl'
+        path, _ = QFileDialog.getSaveFileName(self, 'Export As STL', default,
+                                              'STL Mesh (*.stl);;All Files (*)')
+        if not path:
+            return
+        if not path.lower().endswith('.stl'):
+            path += '.stl'
+        try:
+            _write_stl(path, rec['verts'], rec['faces'])
+        except Exception as exc:
+            QMessageBox.warning(self, 'Export As STL', f'Could not write the STL file:\n{exc}')
+
+    def _export_surface_stl(self, index):
+        if 0 <= index < len(self._surfaces):
+            self._save_mesh_stl(self._surfaces[index])
+
+    def _promote_surface(self, index):
+        """Add a copy of a surface as a top-level mesh object in the tree."""
+        if not (0 <= index < len(self._surfaces)):
+            return
+        src = self._surfaces[index]
+        self._project_meshes.append({
+            'name': src['name'], 'verts': src['verts'], 'faces': src['faces'],
+            'preset': src.get('preset'), 'level': src.get('level'),
+            'shape': src.get('shape'),
+        })
+        self._refresh_project_meshes_tree()
+        self._mark_dirty()
+
+    def _show_project_mesh(self, index):
+        if 0 <= index < len(self._project_meshes):
+            m = self._project_meshes[index]
+            self.view_3d.show_surface(m['verts'], m['faces'], _SURFACE_COLOR,
+                                      source_shape=m.get('shape'))
+            self._refresh_surface_outline()
+
+    def _export_project_mesh_stl(self, index):
+        if 0 <= index < len(self._project_meshes):
+            self._save_mesh_stl(self._project_meshes[index])
+
+    def _remove_project_mesh(self, index):
+        if not (0 <= index < len(self._project_meshes)):
+            return
+        self._project_meshes.pop(index)
+        self._refresh_project_meshes_tree()
+        self._mark_dirty()
+
+    def open_create_surface(self):
+        if not self.volume_data.is_loaded():
+            QMessageBox.warning(self, 'Create Surface', 'Please import a volume first.')
+            return
+        if measure is None:
+            QMessageBox.warning(self, 'Create Surface',
+                                'scikit-image is required to build a surface mesh.')
+            return
+        dlg = SurfaceCreationDialog(self)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        rec = self._build_surface(dlg.preset())
+        if rec is None:
+            return
+        self._surface_counter += 1
+        rec['name'] = f'Surface {self._surface_counter}'
+        self._surfaces.append(rec)
+        self._show_surface_in_3d(rec)
+        self._refresh_surface_tree()
+        self._mark_dirty()
+
+    def _build_surface(self, preset):
+        """Marching cubes on the raw volume at the current isovalue and ``preset``
+        resolution (the sharp, high-quality mesh, exactly as before), then rigidly
+        transform it into the active alignment frame so it sits on the displayed
+        isosurface. The rotation/translation is rigid, so the mesh quality is
+        unchanged. Returns {'verts','faces','preset','level','shape'} or None."""
+        factor = _SURFACE_PRESETS.get(preset, 2)
+        vol = self.volume_data.volume
+        vmin, vmax = float(np.min(vol)), float(np.max(vol))
+        if vmax <= vmin:
+            QMessageBox.warning(self, 'Create Surface', 'The volume has no contrast.')
+            return None
+        level = vmin + self.view_3d.iso_threshold_percent / 100.0 * (vmax - vmin)
+        if not (vmin < level < vmax):
+            QMessageBox.warning(self, 'Create Surface',
+                                'The current isovalue is out of range — adjust it first.')
+            return None
+
+        def build(_on_progress):
+            ds = vol[::factor, ::factor, ::factor]
+            ds = ds if ds.dtype == np.float32 else ds.astype(np.float32)
+            try:
+                verts, faces, _n, _v = measure.marching_cubes(ds, level=level)
+            except (MemoryError, ValueError, RuntimeError) as exc:
+                return ('error', str(exc))
+            if factor > 1:
+                verts = verts * float(factor)
+            return (verts.astype(np.float32), faces.astype(np.int32))
+
+        result = self._load_with_progress(
+            build, label=f'Building {preset.lower()}-resolution surface…',
+            title='Create Surface')
+        if result is None or isinstance(result[0], str):   # None or ('error', msg)
+            QMessageBox.warning(self, 'Create Surface',
+                                'Could not build a surface at this isovalue.')
+            return None
+        verts, faces = result
+        if len(verts) == 0 or len(faces) == 0:
+            QMessageBox.warning(self, 'Create Surface',
+                                'No surface exists at the current isovalue.')
+            return None
+        # Apply the current alignment transform afterwards (rigid → no quality
+        # loss). The cumulative transform maps display(output)→input as
+        # in = R @ out + offset, so raw verts map to out = (in - offset) @ R.
+        if self._align_active:
+            verts = ((verts.astype(np.float64) - self._align_offset)
+                     @ self._align_R).astype(np.float32)
+            shape = tuple(int(s) for s in self._align_shape)
+        else:
+            shape = tuple(int(s) for s in vol.shape)
+        return {'verts': verts, 'faces': faces, 'preset': preset, 'level': level,
+                'shape': shape}
+
+    def _show_surface_in_3d(self, rec):
+        self._active_surface_rec = rec
+        self.view_3d.show_surface(rec['verts'], rec['faces'], _SURFACE_COLOR,
+                                  source_shape=rec.get('shape'))
+        self._refresh_surface_outline()
+
+    def _remap_surfaces(self, old_R, old_offset):
+        """Re-express every child surface mesh in the new active-alignment display
+        frame after the alignment changed from (old_R, old_offset) to the current
+        one, so the surfaces stay registered with the volume.
+
+        Verts are stored in the active alignment's output frame, related to the
+        raw input volume by ``in = out @ R.T + offset`` (R is a rotation). So we
+        map each vertex back to raw input coords through the old transform, then
+        forward into the new display frame."""
+        if not self._surfaces:
+            return
+        old_R   = np.asarray(old_R,      dtype=np.float64)
+        old_off = np.asarray(old_offset, dtype=np.float64)
+        new_R   = np.asarray(self._align_R,      dtype=np.float64)
+        new_off = np.asarray(self._align_offset, dtype=np.float64)
+        new_shape = (tuple(int(s) for s in self._align_shape)
+                     if self._align_shape is not None else None)
+        for rec in self._surfaces:
+            v = rec.get('verts')
+            rec['shape'] = new_shape
+            if v is None or len(v) == 0:
+                continue
+            raw = v.astype(np.float64) @ old_R.T + old_off
+            rec['verts'] = ((raw - new_off) @ new_R).astype(np.float32)
+        # Re-show the active surface so the 3D mesh + 2D outline pick up the move.
+        if self.view_3d._showing_surface and self._active_surface_rec in self._surfaces:
+            self._show_surface_in_3d(self._active_surface_rec)
+
+    def _refresh_surface_outline(self):
+        """Push the active surface's slice-intersection outline to the 2D views
+        (or clear it when no surface is shown)."""
+        v3 = self.view_3d
+        tri = getattr(v3, '_surface_tri', None)
+        if v3._showing_surface and tri is not None and v3._surface_shape is not None:
+            for sv in self._slice_viewers():
+                sv.set_surface_outline(tri, v3._surface_shape)
+        else:
+            for sv in self._slice_viewers():
+                sv.clear_surface_outline()
+
+    def _goto_surface(self, index):
+        if 0 <= index < len(self._surfaces):
+            self._show_surface_in_3d(self._surfaces[index])
+
+    def _remove_surface(self, index):
+        if not (0 <= index < len(self._surfaces)):
+            return
+        self._surfaces.pop(index)
+        self._refresh_surface_tree()   # updates 'Surface Mesh' availability
+        if self._surfaces:
+            self._show_surface_in_3d(self._surfaces[-1])
+        else:
+            self.view_3d.clear_surface()   # no surfaces left → back to the volume
+            self._refresh_surface_outline()
+        self._mark_dirty()
+
     # ── View-time alignment state ────────────────────────────────────────────
     def _reset_alignment_state(self):
         """Reset the cumulative alignment to identity for the loaded volume.
@@ -6692,6 +8610,7 @@ class MainWindow(QMainWindow):
         """Make (R, offset, out_shape) the active cumulative alignment and push it
         to every viewport as a non-destructive, view-time transform."""
         self._mark_dirty()
+        old_R, old_offset = self._align_R, self._align_offset
         self._align_active = True
         self._align_R      = np.asarray(R,      dtype=np.float64)
         self._align_offset = np.asarray(offset, dtype=np.float64)
@@ -6704,13 +8623,16 @@ class MainWindow(QMainWindow):
             sv.set_permanent_transform(self._align_R, self._align_offset,
                                        self._align_shape, aligned)
         self._apply_alignment_to_3d(self._align_R, self._align_offset)
+        # Carry the child surface meshes into the new alignment frame (after the
+        # 3D volume is re-aligned, so the re-shown surface is placed correctly).
+        self._remap_surfaces(old_R, old_offset)
 
-    def _apply_new_alignment(self, R2, offset0, title):
+    def _apply_new_alignment(self, R2, offset0, title, kind='321'):
         """Compose a freshly-picked transform (in the currently displayed frame)
         onto the cumulative alignment and apply it view-time.
 
         ``offset0`` is the pre-bounding-box scipy offset (a picked origin point
-        for 3-2-1, or the dialog offset for Simple Alignment)."""
+        for 3-2-1/geometry, or the dialog offset for Simple Alignment)."""
         if _scipy_affine_transform is None:
             QMessageBox.warning(self, title,
                                 'scipy is required to apply the transformation.')
@@ -6723,7 +8645,7 @@ class MainWindow(QMainWindow):
         # Compose under the existing display→input transform.
         R, offset = _compose_alignment(self._align_R, self._align_offset, R2, off2)
         self._set_view_alignment(R, offset, out_shape)
-        self._record_alignment('321')
+        self._record_alignment(kind)
 
     def reset_alignment(self):
         """User action: drop the view-time alignment and show the raw volume
@@ -6770,6 +8692,11 @@ class MainWindow(QMainWindow):
         if dlg is not None and dlg.isVisible():
             dlg.add_point(point)
             self.view_3d.set_alignment_overlays(dlg.points)
+            return
+        gdlg = self._geom_align_dialog
+        if gdlg is not None and gdlg.isVisible():
+            gdlg.add_point(point)
+            self._on_geom_align_changed()
 
 
 def main():

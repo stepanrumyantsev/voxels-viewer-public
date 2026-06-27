@@ -39,6 +39,15 @@ forward/backward-compatibility checks.
   voxel display in the 2D viewports instead of blocky nearest-neighbour, with no
   measurable performance cost. Remembered between sessions (default Off).
 - Orientation tripod overlay in each viewport.
+- Toolbar buttons whose mode is currently **on** — Lock, Clipping, the 2D
+  coordinate-lines toggle, and the 3D coordinate-planes toggle — get a green
+  background so active modes are easy to spot at a glance.
+- **Capture** per 2D viewport: a camera button (copy to clipboard / save image) and
+  a **record** button. Recording arms a slice-video range mode — the slice slider
+  gains a second handle (a coloured span sets the start/end slice), the other two
+  viewports show the range as two coordinate lines, and a **Start** button with a
+  length (seconds) field renders the slice sweep to an **MP4** at 30 FPS (animated
+  **GIF** fallback if `imageio-ffmpeg` is not installed).
 
 ### Project Structure (sidebar)
 A hierarchical tree above the histogram gives an overview of the project and its
@@ -46,6 +55,10 @@ derived items:
 - **Volume** (top, voxels icon) — **renamable** (right-click → Rename or F2; the
   name is derived from the imported file(s) and saved with the project).
   Right-click → **Properties…** opens **Volume Information**.
+- **Surfaces** — any created **Surface Mesh** (see *3D view*) appears directly
+  under the Volume with a triangle icon. Right-click → **Show in 3D**,
+  **Export → As STL…**, or **Remove**. A surface tracks the volume's active
+  alignment, so applying or switching alignments moves it with the volume.
 - **Alignments** — the alignment history (see below); each entry has a tripod
   icon and the active one is marked **(active)**.
 - **Measurements** and **Gray Values** — one entry per persistent item, each with
@@ -84,8 +97,15 @@ derived items:
   Structure → **Export to CSV…**.
 
 ### 3D view
-- **Isosurface** (marching cubes, with an isovalue slider) and **Phong Volume**
-  rendering; the Phong render respects the histogram window.
+- Renderer dropdown: **Isosurface** (marching cubes, with an isovalue slider),
+  **Phong Volume** (respects the histogram window), **Surface Mesh** (shown only
+  once a surface exists), and **Off** (draws nothing for the object — surface,
+  volume, and coordinate planes all hidden).
+- **Create Surface** (**Operations → Create Surface…**) builds an STL mesh from
+  the current isovalue at a **Low / Medium / High** resolution (High ≈ one vertex
+  per surface voxel) and switches the renderer to **Surface Mesh**. The mesh is
+  listed under the Volume in the Project Structure, and where it crosses each 2D
+  viewport's slice it draws a thin yellow **outline**.
 - **Coordinate planes** — colour-coded slice planes (**red** = YZ, **green** = XZ,
   **blue** = XY), semi-transparent with white outlines that stay visible through
   the volume. Toggle them with the button next to the isovalue slider. Each plane
@@ -112,6 +132,8 @@ derived items:
   created in that alignment, you're warned that they'll be removed with it.
 - The active alignment is applied at display time only (the voxel data is never
   modified) and is **pre-resampled once** so panning/scrolling stays fast.
+- Any **surface meshes** are carried into the new frame whenever you apply or
+  switch alignments, so they stay registered with the volume.
 
 ### Import / projects
 - **File → Import → Import Slice Files…** (TIFF or raw) and **Import Volume…**
@@ -121,9 +143,10 @@ derived items:
 - **File → Open / Save Voxels Project…** — saves the source reference, volume
   name, window, viewport state, the full alignment history (and which is active),
   all measurements and gray-value tools, lock state, render mode, and camera to a
-  `.voxels` file. The title bar shows the current project name (or **New Project**
-  until it is saved), and closing the app prompts to **save unsaved changes**
-  (**Yes / No / Cancel**) when there are any.
+  `.voxels` file. Any surface meshes are written as **`.stl` files alongside** the
+  project and reloaded with it. The title bar shows the current project name (or
+  **New Project** until it is saved), and closing the app prompts to **save
+  unsaved changes** (**Yes / No / Cancel**) when there are any.
 - **Operations → Volume Information…** — a read-only histogram plus a table of
   voxel dimensions, physical dimensions, voxel size, data type, and volume size.
 
@@ -141,14 +164,17 @@ derived items:
 Install the dependencies into your Python environment:
 
 ```bash
-python3 -m pip install PySide6 pyqtgraph numpy imageio tifffile scikit-image PyOpenGL scipy
+python3 -m pip install PySide6 pyqtgraph numpy imageio imageio-ffmpeg tifffile scikit-image PyOpenGL scipy
 ```
 
 If you prefer PyQt5, swap the Qt binding:
 
 ```bash
-python3 -m pip install PyQt5 pyqtgraph numpy imageio tifffile scikit-image PyOpenGL scipy
+python3 -m pip install PyQt5 pyqtgraph numpy imageio imageio-ffmpeg tifffile scikit-image PyOpenGL scipy
 ```
+
+`imageio-ffmpeg` is optional and only needed for **MP4** slice-video export; without
+it, recording falls back to animated **GIF**.
 
 On **macOS**, to show the application name ("Voxels Viewer") in the menu bar when
 running from source, also install PyObjC (optional):
@@ -166,8 +192,9 @@ python3 -m pip install pyobjc-framework-Cocoa
 | numpy | Volume data and math |
 | PyOpenGL | Required by pyqtgraph for the 3D view |
 | scipy | Alignment resampling and gray-value profile sampling |
-| scikit-image | Isosurface (marching cubes) in the 3D view |
-| imageio | Image/TIFF reading |
+| scikit-image | Isosurface and Surface Mesh (marching cubes) in the 3D view |
+| imageio | Image/TIFF reading; slice-video frame writing |
+| imageio-ffmpeg | Optional; MP4 slice-video export (GIF fallback without it) |
 | tifffile | More reliable TIFF reading (recommended) |
 | pyobjc-framework-Cocoa | macOS-only, optional; sets the app menu name from source |
 
