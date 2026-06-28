@@ -167,7 +167,7 @@ APP_NAME = 'Voxels Viewer'
 # and forms the full version (YY.M.build) used in the About dialog and saved
 # into .voxels project files for compatibility checks.
 APP_VERSION = '26.6'          # June 2026
-APP_BUILD = 101
+APP_BUILD = 106
 APP_VERSION_FULL = f'{APP_VERSION}.{APP_BUILD}'
 
 
@@ -404,16 +404,34 @@ texts are available in each project&rsquo;s repository.
 
 <h3>NumPy</h3>
 <p>
-  Copyright &copy; 2005&ndash;2024 NumPy Developers.<br>
+  Copyright &copy; 2005&ndash;2026 NumPy Developers.<br>
   Distributed under the <b>BSD 3-Clause License</b>.<br>
   <a href="https://numpy.org">https://numpy.org</a>
 </p>
 
+<h3>SciPy</h3>
+<p>
+  Copyright &copy; 2001&ndash;2026 SciPy Developers; &copy; 2003 Enthought, Inc.<br>
+  Distributed under the <b>BSD 3-Clause License</b>.<br>
+  <a href="https://scipy.org">https://scipy.org</a>
+</p>
+
 <h3>imageio</h3>
 <p>
-  Copyright &copy; 2014&ndash;2024 imageio contributors.<br>
+  Copyright &copy; 2014&ndash;2026 imageio contributors.<br>
   Distributed under the <b>BSD 2-Clause License</b>.<br>
   <a href="https://imageio.readthedocs.io">https://imageio.readthedocs.io</a>
+</p>
+
+<h3>imageio-ffmpeg &amp; FFmpeg</h3>
+<p>
+  imageio-ffmpeg &mdash; Copyright &copy; 2018&ndash;2026 imageio contributors,
+  distributed under the <b>BSD 2-Clause License</b>. It bundles
+  <b>FFmpeg</b> (&copy; the FFmpeg developers), used here under the
+  <b>GNU Lesser General Public License v2.1 or later (LGPL-2.1+)</b>, for MP4
+  slice-video export.<br>
+  <a href="https://github.com/imageio/imageio-ffmpeg">https://github.com/imageio/imageio-ffmpeg</a>
+  &middot; <a href="https://ffmpeg.org">https://ffmpeg.org</a>
 </p>
 
 <h3>tifffile</h3>
@@ -433,8 +451,27 @@ texts are available in each project&rsquo;s repository.
 <h3>PyOpenGL</h3>
 <p>
   Copyright &copy; 2000&ndash;2011 Mike Fletcher.<br>
-  Distributed under the <b>BSD-style License</b>.<br>
+  Distributed under the <b>BSD 3-Clause License</b>.<br>
   <a href="https://pyopengl.sourceforge.net">https://pyopengl.sourceforge.net</a>
+</p>
+
+<h3>PyObjC <span style="color:gray;">(macOS, optional)</span></h3>
+<p>
+  Copyright &copy; Ronald Oussoren and contributors.<br>
+  Distributed under the <b>MIT License</b>.<br>
+  <a href="https://pyobjc.readthedocs.io">https://pyobjc.readthedocs.io</a>
+</p>
+
+<h3>Python</h3>
+<p>
+  Copyright &copy; 2001&ndash;2026 Python Software Foundation.<br>
+  Distributed under the <b>Python Software Foundation License (PSF)</b>.<br>
+  <a href="https://www.python.org">https://www.python.org</a>
+</p>
+
+<p style="color:gray;">
+  Each library remains the property of its respective authors and is used under
+  its own license terms; the full license texts are available with each project.
 </p>
 """
 
@@ -3880,6 +3917,7 @@ class VolumeRender3D(QWidget):
         self._alignment_mode = False
         self._alignment_points = []   # voxel-coord tuples
         self._alignment_gl_items = [] # live GL items for overlays
+        self._geom_overlay = None     # (geom_type, fit) while a geometry fit is shown
         self._render_factor = 1
         self._render_shape = (1, 1, 1)
         self._render_volume = None    # downsampled float32 array used for picking
@@ -4122,6 +4160,7 @@ class VolumeRender3D(QWidget):
 
     def set_alignment_overlays(self, points):
         self._alignment_points = list(points)
+        self._geom_overlay = None          # 3-2-1 / simple-alignment overlay
         self._rebuild_alignment_overlays()
 
     def clear_alignment_overlays(self):
@@ -4132,9 +4171,12 @@ class VolumeRender3D(QWidget):
                 pass
         self._alignment_gl_items = []
         self._alignment_points = []
+        self._geom_overlay = None
 
     def _rebuild_alignment_overlays(self):
-        """Re-create GL overlay items from stored alignment points."""
+        """Re-create GL overlay items from stored alignment points. Restores the
+        correct overlay for the active mode (geometry-fit wireframe vs 3-2-1
+        plane/line) so a surface/volume re-render never wipes or mismatches it."""
         for item in self._alignment_gl_items:
             try:
                 self.gl_view.removeItem(item)
@@ -4143,6 +4185,9 @@ class VolumeRender3D(QWidget):
         self._alignment_gl_items = []
         pts = self._alignment_points
         if not pts:
+            return
+        if self._geom_overlay is not None:
+            self._build_geometry_overlay_items(pts, *self._geom_overlay)
             return
         n = len(pts)
 
@@ -4229,10 +4274,16 @@ class VolumeRender3D(QWidget):
     def set_geometry_overlay(self, points, geom_type, fit):
         """Show picked points (yellow dots) plus the fitted geometry (yellow
         wireframe) for the Geometry-based alignment. Reuses the alignment-overlay
-        item list, so clear_alignment_overlays() tears it down."""
+        item list, so clear_alignment_overlays() tears it down. The (geom_type,
+        fit) is remembered so a surface/volume re-render restores this same
+        wireframe rather than the 3-2-1 plane/line overlay."""
         self.clear_alignment_overlays()
         self._alignment_points = list(points)
+        self._geom_overlay = (geom_type, fit)
+        self._rebuild_alignment_overlays()
 
+    def _build_geometry_overlay_items(self, points, geom_type, fit):
+        """Add the geometry-fit overlay (yellow dots + fitted wireframe)."""
         def add(item):
             if item is None:
                 return
@@ -4274,6 +4325,66 @@ class VolumeRender3D(QWidget):
                                            + np.sin(ang)[:, None] * e2[None, :]))
         return pts.astype(np.float32)
 
+    @staticmethod
+    def _convex_hull_2d(P):
+        """Convex hull (CCW) of 2D points via Andrew's monotone chain. Returns the
+        hull vertices, or the (≤2) distinct points for a degenerate/collinear set."""
+        pts = np.unique(np.round(np.asarray(P, dtype=np.float64), 6), axis=0)
+        pts = pts[np.lexsort((pts[:, 1], pts[:, 0]))]
+        if len(pts) < 3:
+            return pts
+
+        def cross(o, a, b):
+            return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+        lower = []
+        for p in pts:
+            while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+                lower.pop()
+            lower.append(p)
+        upper = []
+        for p in pts[::-1]:
+            while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+                upper.pop()
+            upper.append(p)
+        hull = np.array(lower[:-1] + upper[:-1])
+        return hull if len(hull) >= 3 else pts
+
+    @staticmethod
+    def _min_area_rect_2d(P, pad=0.0):
+        """Closed (5×2) corner loop of the minimum-area rectangle enclosing the 2D
+        points ``P``, oriented to the points (the min-area rect always has a side
+        collinear with a convex-hull edge). A PCA axis is also tried so nearly
+        collinear sets still get a sensible orientation. None if < 2 distinct pts."""
+        P = np.asarray(P, dtype=np.float64)
+        uniq = np.unique(np.round(P, 6), axis=0)
+        if len(uniq) < 2:
+            return None
+        dirs = []
+        hull = VolumeRender3D._convex_hull_2d(uniq)
+        if hull is not None and len(hull) >= 2:
+            for i in range(len(hull)):
+                e = hull[(i + 1) % len(hull)] - hull[i]
+                n = float(np.hypot(e[0], e[1]))
+                if n > 1e-9:
+                    dirs.append(e / n)
+        q = uniq - uniq.mean(axis=0)
+        _, V = np.linalg.eigh(q.T @ q)
+        dirs.append(V[:, -1])                       # principal axis (PCA fallback)
+        best = None
+        for u in dirs:
+            v = np.array([-u[1], u[0]])
+            au, av = P @ u, P @ v
+            umin, umax = au.min() - pad, au.max() + pad
+            vmin, vmax = av.min() - pad, av.max() + pad
+            area = (umax - umin) * (vmax - vmin)
+            if best is None or area < best[0]:
+                best = (area, np.array([
+                    umin * u + vmin * v, umax * u + vmin * v,
+                    umax * u + vmax * v, umin * u + vmax * v,
+                    umin * u + vmin * v]))
+        return best[1] if best else None
+
     def _make_geometry_wire(self, geom_type, fit, points):
         """Yellow wireframe items for the fitted plane / cylinder / cone."""
         items = []
@@ -4286,14 +4397,22 @@ class VolumeRender3D(QWidget):
                 z = self._gl_dir(fit['normal'])
                 c = self._voxel_to_gl(fit['point']).astype(np.float64)
                 e1, e2 = self._perp_basis(z)
-                du = (gpts - c) @ e1
-                dv = (gpts - c) @ e2
-                hu = float(np.max(np.abs(du))) + pad if len(gpts) else 10.0
-                hv = float(np.max(np.abs(dv))) + pad if len(gpts) else 10.0
-                corners = np.array([
-                    c + e1 * hu + e2 * hv, c - e1 * hu + e2 * hv,
-                    c - e1 * hu - e2 * hv, c + e1 * hu - e2 * hv,
-                    c + e1 * hu + e2 * hv], dtype=np.float32)
+                # Tight, point-oriented rectangle: the minimum-area bounding box of
+                # the picked points projected onto the plane (only a small margin so
+                # the markers aren't clipped), not a fixed-orientation padded box.
+                small_pad = max(max(self._render_shape) * 0.01, 1.0)
+                rel = gpts - c
+                uv = np.column_stack([rel @ e1, rel @ e2]) if len(gpts) else None
+                rect = self._min_area_rect_2d(uv, pad=small_pad) if uv is not None else None
+                if rect is not None:
+                    corners = (c[None, :] + rect[:, 0:1] * e1[None, :]
+                               + rect[:, 1:2] * e2[None, :]).astype(np.float32)
+                else:
+                    hu = hv = 10.0
+                    corners = np.array([
+                        c + e1 * hu + e2 * hv, c - e1 * hu + e2 * hv,
+                        c - e1 * hu - e2 * hv, c + e1 * hu - e2 * hv,
+                        c + e1 * hu + e2 * hv], dtype=np.float32)
                 items.append(gl.GLLinePlotItem(pos=corners, color=yellow, width=2,
                                                antialias=True, mode='line_strip'))
             elif geom_type == 'Cylinder':
@@ -4429,6 +4548,50 @@ class VolumeRender3D(QWidget):
         except Exception:
             return None, None
 
+    def _pick_surface_point(self, cam, ray):
+        """Ray-cast (Möller–Trumbore) against the displayed surface mesh and return
+        the nearest hit as voxel coords, in the same convention as the volume pick
+        (so geometry alignment treats surface- and volume-picked points alike), or
+        None on a miss."""
+        tri = self._surface_tri
+        if tri is None or len(tri) == 0:
+            return None
+        rshape = np.asarray(self._render_shape, dtype=np.float64)
+        sshape = (np.asarray(self._surface_shape, dtype=np.float64)
+                  if self._surface_shape is not None else None)
+        t = tri.astype(np.float64)
+        # Place the triangles in GL world space exactly as _render_surface does.
+        if sshape is not None and np.all(sshape > 0) and np.all(rshape > 1):
+            gl_tri = t * (rshape / sshape) - rshape / 2.0
+        else:
+            allv = t.reshape(-1, 3)
+            mid = (allv.min(axis=0) + allv.max(axis=0)) / 2.0
+            gl_tri = t - mid
+        v0, v1, v2 = gl_tri[:, 0], gl_tri[:, 1], gl_tri[:, 2]
+        e1, e2 = v1 - v0, v2 - v0
+        pvec = np.cross(ray, e2)
+        det = np.einsum('ij,ij->i', e1, pvec)
+        mask = np.abs(det) > 1e-9
+        if not mask.any():
+            return None
+        inv = np.zeros_like(det)
+        inv[mask] = 1.0 / det[mask]
+        tvec = cam - v0
+        u = np.einsum('ij,ij->i', tvec, pvec) * inv
+        qvec = np.cross(tvec, e1)
+        v = (qvec @ ray) * inv
+        thit = np.einsum('ij,ij->i', e2, qvec) * inv
+        hit = mask & (u >= -1e-6) & (v >= -1e-6) & (u + v <= 1.0 + 1e-6) & (thit > 1e-4)
+        if not hit.any():
+            return None
+        t_near = float(np.min(np.where(hit, thit, np.inf)))
+        hit_gl = cam + ray * t_near
+        vox = (hit_gl + rshape / 2.0) * self._render_factor
+        raw = self.volume_data.volume.shape
+        return (int(np.clip(vox[0], 0, raw[0] - 1)),
+                int(np.clip(vox[1], 0, raw[1] - 1)),
+                int(np.clip(vox[2], 0, raw[2] - 1)))
+
     def _pick_volume_point(self, screen_pos):
         """Raymarch through the rendered volume and return voxel coords of the first
         visible surface hit (iso threshold in Isosurface mode, AABB entry otherwise)."""
@@ -4446,6 +4609,13 @@ class VolumeRender3D(QWidget):
             cam, ray = self._ray_from_screen(ndc_x, ndc_y)
             if cam is None:
                 return None
+
+            # ── Surface Mesh mode: land the point on the mesh itself ─────────────
+            if self._showing_surface and self._surface_tri is not None:
+                pt = self._pick_surface_point(cam, ray)
+                if pt is not None:
+                    return pt
+                # Mesh miss → fall through to the volume box as a best-effort.
 
             # ── Ray-AABB intersection with the rendered (downsampled) volume box ──
             shape = np.array(self._render_shape, dtype=np.float64)
@@ -4623,6 +4793,9 @@ class VolumeRender3D(QWidget):
                              drawEdges=False, glOptions='opaque',
                              color=self._surface_color)
         self.gl_view.addItem(mesh)
+        # Keep any alignment pick markers / fitted-geometry wireframe visible on
+        # the surface (gl_view.clear() above removed them); points land on the mesh.
+        self._rebuild_alignment_overlays()
         if reset_camera:
             self.gl_view.setCameraPosition(distance=max(self._render_shape) * 2.5)
 
@@ -5403,12 +5576,34 @@ def _frame_from_z(z, x_hint):
     return np.column_stack([x, y, z]).astype(np.float64)
 
 
+def _plane_box_x_dir(proj, z):
+    """In-plane unit direction (3D) of the *longer* side of the minimum-area
+    bounding box of the in-plane points ``proj`` (taken relative to the plane
+    centre), or None if it can't be determined. Used to orient the alignment's
+    X/Y to the same box the preview draws."""
+    z = np.asarray(z, dtype=np.float64)
+    z = z / (np.linalg.norm(z) or 1.0)
+    e1, e2 = VolumeRender3D._perp_basis(z)
+    P2 = np.column_stack([proj @ e1, proj @ e2])
+    rect = VolumeRender3D._min_area_rect_2d(P2, pad=0.0)
+    if rect is None:
+        return None
+    su, sv = rect[1] - rect[0], rect[3] - rect[0]     # the two box sides (2D)
+    side = su if np.hypot(su[0], su[1]) >= np.hypot(sv[0], sv[1]) else sv
+    n = float(np.hypot(side[0], side[1]))
+    if n < 1e-9:
+        return None
+    side = side / n
+    return side[0] * e1 + side[1] * e2
+
+
 def _geometry_alignment_transform(geom_type, fit, pts):
     """Return (R, origin) for a geometry-based alignment, or None.
 
     Z is the plane normal / cylinder axis / cone axis. For a plane the in-plane
-    X/Y come from the principal directions of the points projected onto the plane
-    (its oriented bounding box). For a cylinder/cone X/Y are derived from the
+    X/Y are aligned to the sides of the minimum-area bounding box of the points
+    projected onto the plane (the same box shown in the preview): X along its
+    longer side, Y along the shorter. For a cylinder/cone X/Y are derived from the
     current object orientation (the world axis least parallel to Z), keeping the
     rotation about the axis minimal."""
     if fit is None:
@@ -5421,11 +5616,13 @@ def _geometry_alignment_transform(geom_type, fit, pts):
         c = np.asarray(fit['point'], dtype=np.float64)
         centered = pts - c
         proj = centered - np.outer(centered @ z, z)
-        try:
-            _, _, vt = np.linalg.svd(proj, full_matrices=False)
-            x_hint = vt[0]
-        except np.linalg.LinAlgError:
-            x_hint = np.array([1.0, 0.0, 0.0])
+        x_hint = _plane_box_x_dir(proj, z)
+        if x_hint is None:                # degenerate box → principal axis fallback
+            try:
+                _, _, vt = np.linalg.svd(proj, full_matrices=False)
+                x_hint = vt[0]
+            except np.linalg.LinAlgError:
+                x_hint = np.array([1.0, 0.0, 0.0])
         R = _frame_from_z(z, x_hint)
         origin = c
     elif geom_type == 'Cylinder':
@@ -6650,6 +6847,29 @@ class MainWindow(QMainWindow):
             return
         dims, voxels, dtype, flip_z, big_endian = dialog.get_metadata()
         if raw_mode:
+            # Fail fast with a clear message when the entered geometry doesn't
+            # match the file — the most common cause of a raw import that seems
+            # to stall (rather than reading garbage or hanging on a huge read).
+            itemsize = int(np.dtype(dtype).itemsize)
+            expected = int(np.prod(dims)) * itemsize
+            try:
+                actual = os.path.getsize(path)
+            except OSError:
+                actual = -1
+            if expected <= 0:
+                QMessageBox.warning(self, 'Import Volume',
+                                    'Please enter non-zero width, height, and depth.')
+                return
+            if actual >= 0 and actual != expected:
+                QMessageBox.warning(
+                    self, 'Import Volume',
+                    f'The file is {actual:,} bytes, but the entered parameters '
+                    f'expect {expected:,} bytes\n'
+                    f'({dims[0]} × {dims[1]} × {dims[2]} voxels × {itemsize} '
+                    f'byte/voxel).\n\n'
+                    'Check the width, height, depth, data type, and byte order '
+                    '— one of them does not match this file.')
+                return
             volume = self._load_with_progress(
                 lambda cb: self.load_raw_volume(path, dims, dtype, flip_z,
                                                 big_endian, on_progress=cb),
@@ -6971,11 +7191,17 @@ class MainWindow(QMainWindow):
                 with open(path, 'rb') as rawfile:
                     data = np.fromfile(rawfile, dtype=file_dtype, count=count)
             else:
-                # Read in Z-slice chunks so on_progress(current, total) fires
-                # throughout. Progress is reported in slices (small ints) to
-                # avoid overflowing the int signal on very large volumes.
+                # Read in chunks so on_progress(current, total) fires throughout.
+                # Size each chunk by BYTES (≈32 MB), not by a fixed fraction of
+                # the slice count: with large slices a "depth/100" chunk can be
+                # hundreds of MB, so the first update would only arrive after a
+                # long read and the bar looks stuck at 0. A byte cap keeps updates
+                # frequent regardless of slice size. Progress is reported in
+                # slices (small ints) to avoid overflowing the int signal.
                 nz, voxels_per_slice = dims[2], dims[1] * dims[0]
-                chunk_z = max(1, nz // 100)        # ≈ 100 progress ticks
+                itemsize = np.dtype(file_dtype).itemsize
+                bytes_per_slice = max(1, voxels_per_slice * itemsize)
+                chunk_z = max(1, min(nz, (32 * 1024 * 1024) // bytes_per_slice))
                 data = np.empty(count, dtype=file_dtype)
                 read = 0
                 with open(path, 'rb') as rawfile:

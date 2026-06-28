@@ -230,3 +230,31 @@ purpose — personal, academic, or commercial — subject to:
 
 The full license and third-party library notices are available in **Help →
 About** within the application.
+
+## Third-Party Software
+
+Voxels Viewer is built on the following open-source components, each used under
+its own license. Each library remains the property of its respective authors;
+full license texts are available with each project.
+
+| Component | Use | License |
+|---|---|---|
+| [Python](https://www.python.org) | Runtime / interpreter | Python Software Foundation License (PSF) |
+| [PyQt5](https://riverbankcomputing.com/software/pyqt) | Qt bindings — **used in the packaged macOS app** | GPL v3 or commercial — © Riverbank Computing |
+| [PySide6 / Qt for Python](https://www.qt.io/qt-for-python) | Alternative Qt binding (run-from-source) | LGPL v3 — © The Qt Company |
+| [Qt](https://www.qt.io) | GUI toolkit (via the binding) | LGPL v3 — © The Qt Company Ltd. |
+| [pyqtgraph](https://www.pyqtgraph.org) | 2D/3D plotting, image views, ROIs | MIT — © Luke Campagnola & contributors |
+| [NumPy](https://numpy.org) | Array math | BSD 3-Clause — © NumPy Developers |
+| [SciPy](https://scipy.org) | Alignment resampling, profile sampling | BSD 3-Clause — © SciPy Developers |
+| [scikit-image](https://scikit-image.org) | Marching cubes (isosurface / surface mesh) | BSD 3-Clause — © the scikit-image team |
+| [PyOpenGL](https://pyopengl.sourceforge.net) | OpenGL for the 3D view | BSD 3-Clause — © Mike Fletcher |
+| [imageio](https://imageio.readthedocs.io) | Image/TIFF I/O, video frame writing | BSD 2-Clause — © imageio contributors |
+| [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg) | MP4 export (bundles FFmpeg) | BSD 2-Clause — © imageio contributors |
+| [FFmpeg](https://ffmpeg.org) | Video encoder (bundled binary) | LGPL v2.1+ — © the FFmpeg developers |
+| [tifffile](https://pypi.org/project/tifffile) | Robust TIFF reading | BSD 3-Clause — © Christoph Gohlke |
+| [PyObjC](https://pyobjc.readthedocs.io) | macOS menu name (optional) | MIT — © Ronald Oussoren & contributors |
+
+> **Note:** the packaged macOS builds (DMG and App Store) bundle **PyQt5**, which
+> is licensed under **GPL v3**. If you redistribute those builds, the GPL's terms
+> apply to the Qt binding; switching the bundle to **PySide6** (LGPL v3) avoids
+> the GPL copyleft obligation.
