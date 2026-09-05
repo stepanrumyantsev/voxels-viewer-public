@@ -67,6 +67,14 @@ except ImportError:
     )
     from PyQt5.QtCore import Qt, pyqtSignal as Signal, pyqtSlot as Slot
 
+# Qt 6 moved QAction, QActionGroup and QShortcut from QtWidgets to QtGui. This
+# file spells them QtWidgets.* (the Qt 5 home), so backfill those names when
+# running on PySide6 — that keeps a single spelling working on both bindings.
+for _name in ('QAction', 'QActionGroup', 'QShortcut'):
+    if not hasattr(QtWidgets, _name) and hasattr(QtGui, _name):
+        setattr(QtWidgets, _name, getattr(QtGui, _name))
+del _name
+
 try:
     import pyqtgraph as pg
 except ImportError:
