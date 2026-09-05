@@ -73,6 +73,13 @@ derived items:
 - **Auto Min Max**: drag a rectangle in any 2D viewport to set the window from
   the min/max inside it. An on-screen hint shows while active; press **Esc** to
   exit. Windowing updates in real time.
+- **Auto Contrast**: splits the histogram into 16 clusters of minimal variance
+  and gives each one an equal 1/16 slice of the greyscale, so densities that a
+  linear window squashes together separate into distinct greys. The histogram
+  bars and the mapping curve both redraw to preview the result, and the 2D
+  slices and the 3D volume render share the mapping. **Reset** restores the
+  plain linear ramp (the window itself is left alone); moving the window also
+  resets it, since the clustering belongs to the range it was computed over.
 - Linear / logarithmic histogram scale (Preferences).
 
 ### Measurements (2D viewports)
@@ -208,6 +215,32 @@ From the project folder:
 ```bash
 python3 ct_viewer.py
 ```
+
+## Sample data
+
+`tools/make_demo_volume.py` generates a small synthetic CT-like phantom, useful
+for trying features without a real scan — Auto Contrast in particular:
+
+```bash
+python3 tools/make_demo_volume.py
+```
+
+This writes `testdata/demo_shells_96.tif`, a 1.8 MB multipage 16-bit TIFF
+(96 × 96 × 96). Load it with **File ▸ Import Volume…**, switch the file filter
+to TIFF, and accept the pre-filled metadata dialog.
+
+The phantom is a noisy air background around five nested spherical shells. Four
+of them sit only ~2500 apart on a 0–65535 scale, so a linear window renders them
+as near-identical greys and **Auto Contrast** pulls them apart.
+
+The generator is versioned but its output is not — `testdata/` is gitignored, so
+regenerate the file rather than committing it. The volume is seeded, so every
+run produces exactly the same data.
+
+Note that it is a synthetic phantom, not real CT: Gaussian shells and Gaussian
+noise are far better behaved than a real scan, with no beam hardening, streak
+artefacts, or partial-volume edges. Use it to exercise the UI, not to judge how
+a feature will behave on real data.
 
 ## License
 

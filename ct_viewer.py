@@ -555,6 +555,12 @@ class VolumeData:
         self.signed = False
         self.transform = np.eye(4, dtype=np.float32)
         self.histogram = None
+        self.bin_edges = None
+        # A finer histogram kept alongside the 256-bin display one, so Auto
+        # Contrast can place its cluster boundaries on real intensities instead
+        # of snapping them to coarse display bins.
+        self.fine_histogram = None
+        self.fine_bin_edges = None
 
     def is_loaded(self):
         return self.volume is not None
@@ -569,11 +575,11 @@ class VolumeData:
 
     def compute_histogram(self):
         if self.volume is None:
-            self.histogram = None
+            self._clear_histograms()
             return
         flat = self.volume.ravel()   # view if C-contiguous, copy otherwise
         if flat.size == 0:
-            self.histogram = None
+            self._clear_histograms()
             return
         try:
             # Sample large volumes so np.histogram never needs a full float64 copy
@@ -581,8 +587,18 @@ class VolumeData:
             if flat.size > 4_000_000:
                 flat = flat[::max(1, flat.size // 4_000_000)]
             self.histogram, self.bin_edges = np.histogram(flat, bins=256)
+            # Same samples, finer bins — a second pass over an array already in
+            # cache, so this costs far less than the 256-bin pass that built it.
+            self.fine_histogram, self.fine_bin_edges = np.histogram(
+                flat, bins=AUTO_CONTRAST_BINS)
         except Exception:
-            self.histogram = None
+            self._clear_histograms()
+
+    def _clear_histograms(self):
+        self.histogram = None
+        self.bin_edges = None
+        self.fine_histogram = None
+        self.fine_bin_edges = None
 
     def apply_intensity_mapping(self, mapping_curve):
         if self.volume is None:
@@ -1245,9 +1261,150 @@ class ProjectStructureWidget(QWidget):
         self.tree.blockSignals(False)
 
 
+# ── Auto Contrast ────────────────────────────────────────────────────────────
+# How many equal slices of the output range Auto Contrast hands out — one per
+# cluster found in the histogram.
+AUTO_CONTRAST_K = 16
+# Bins used for the clustering. Finer than the 256-bin display histogram so the
+# boundaries land on meaningful intensities, but small enough that the O(k·n²)
+# dynamic program below stays well under a tenth of a second.
+AUTO_CONTRAST_BINS = 1024
+
+
+def _kmeans_1d_weighted(centers, weights, k):
+    """Exact 1-D k-means on weighted points, by dynamic programming.
+
+    ``centers`` must be sorted ascending, and ``weights[i]`` is how many voxels
+    sit at ``centers[i]``. This minimises the total within-cluster sum of
+    squares of the underlying *voxel population* — every voxel counts once, so
+    a tall histogram bin pulls a boundary far harder than a sparse one. That is
+    the ordinary k-means objective; feeding it bin counts is just the weighted
+    form of it.
+
+    Being a dynamic program over sorted data, this is exact — unlike Lloyd's
+    algorithm it cannot land in a local minimum, and needs no seeding or
+    restarts. Cost is O(k·n²) time and O(n²) memory, which is why the caller
+    keeps n near ``AUTO_CONTRAST_BINS``.
+
+    Returns the ``k-1`` interior boundary intensities, or None when the data
+    can't be split into ``k`` non-empty clusters.
+    """
+    x = np.asarray(centers, dtype=np.float64)
+    w = np.asarray(weights, dtype=np.float64)
+    keep = w > 0                       # empty bins carry no voxels to cluster
+    x, w = x[keep], w[keep]
+    n = x.size
+    if k < 2 or n < k:
+        return None
+    span = float(x[-1] - x[0])
+    if span <= 0:
+        return None
+
+    # Normalise position and weight before accumulating. Raw CT values squared
+    # and multiplied by billions of voxels would eat most of float64's mantissa
+    # in the prefix sums below; scaling to ~1 keeps the sums well conditioned.
+    # Neither rescaling changes which partition is optimal.
+    x0 = float(x[0])
+    xs = (x - x0) / span
+    ws = w / float(w.sum())
+
+    # Prefix sums make any cluster's sum of squares an O(1) lookup:
+    #   SSE(i..j) = Σwx² − (Σwx)² / Σw
+    W = np.concatenate(([0.0], np.cumsum(ws)))
+    S = np.concatenate(([0.0], np.cumsum(ws * xs)))
+    Q = np.concatenate(([0.0], np.cumsum(ws * xs * xs)))
+
+    i_idx = np.arange(n)[:, None]
+    j_idx = np.arange(n)[None, :]
+    dW = W[j_idx + 1] - W[i_idx]
+    dS = S[j_idx + 1] - S[i_idx]
+    dQ = Q[j_idx + 1] - Q[i_idx]
+    cost = dQ - np.where(dW > 0, dS * dS / np.where(dW > 0, dW, 1.0), 0.0)
+    cost = np.maximum(cost, 0.0)       # clamp round-off below zero
+    cost[i_idx > j_idx] = np.inf       # a cluster can't run backwards
+
+    # D[j] = cheapest way to cover the first j points with m clusters;
+    # back[m][j] remembers where that final cluster started.
+    D = np.full(n + 1, np.inf)
+    D[0] = 0.0
+    back = np.zeros((k + 1, n + 1), dtype=np.int64)
+    for m in range(1, k + 1):
+        cand = D[:n][:, None] + cost   # cand[i, j] = split before i, then i..j
+        arg = np.argmin(cand, axis=0)
+        nxt = np.full(n + 1, np.inf)
+        nxt[1:] = cand[arg, np.arange(n)]
+        back[m, 1:] = arg
+        D = nxt
+    if not np.isfinite(D[n]):
+        return None
+
+    # Walk the remembered split points back out, innermost cluster first.
+    bounds = []
+    j = n
+    for m in range(k, 1, -1):
+        i = int(back[m, j])
+        if i <= 0:
+            return None
+        bounds.append(0.5 * (x[i - 1] + x[i]))   # boundary sits between clusters
+        j = i
+    bounds.reverse()
+    return bounds
+
+
+def _auto_contrast_knots(centers, counts, k=AUTO_CONTRAST_K):
+    """Interior mapping knots that give each of the ``k`` clusters an equal
+    1/k slice of the output range — cluster 1 fills the first 1/16 of the
+    greyscale, cluster 2 the second, and so on.
+
+    Returns a list of ``(intensity, mapped)`` pairs, or None if clustering
+    wasn't possible.
+    """
+    bounds = _kmeans_1d_weighted(centers, counts, k)
+    if not bounds:
+        return None
+    return [(float(b), (i + 1) / float(k)) for i, b in enumerate(bounds)]
+
+
+def _curve_xy(points):
+    """Split a mapping curve into strictly usable ``np.interp`` arrays.
+
+    The curve's first two points share y=0 and its last two share y=1, so the
+    x values can repeat; ``np.interp`` needs a non-decreasing x, which the
+    curve always satisfies by construction.
+    """
+    xs = np.array([p[0] for p in points], dtype=np.float64)
+    ys = np.array([p[1] for p in points], dtype=np.float64)
+    return xs, ys
+
+
+def _curve_lut(points, lo, hi, n=256):
+    """A 256-entry greyscale LUT sampling the mapping curve across [lo, hi].
+
+    pyqtgraph scales pixel values through ``levels`` into LUT indices, so entry
+    i corresponds to intensity ``lo + i/(n-1) * (hi - lo)``. A plain linear
+    window therefore yields the identity ramp — byte-for-byte what the viewer
+    drew before Auto Contrast existed.
+    """
+    xs, ys = _curve_xy(points)
+    if hi <= lo:
+        hi = lo + 1e-9
+    sample = np.linspace(lo, hi, n)
+    mapped = np.interp(sample, xs, ys, left=0.0, right=1.0)
+    gray = np.clip(mapped * 255.0, 0, 255).astype(np.ubyte)
+    lut = np.empty((n, 3), dtype=np.ubyte)
+    lut[:, 0] = lut[:, 1] = lut[:, 2] = gray
+    return lut
+
+
+def _curve_is_linear(points):
+    """True when the curve is the plain two-point window ramp (no extra knots)."""
+    return points is None or len(points) <= 4
+
+
 class BrightnessCurveWidget(QWidget):
     curve_changed = Signal(object)
     auto_minmax_toggled = Signal(bool)
+    auto_contrast_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1261,6 +1418,9 @@ class BrightnessCurveWidget(QWidget):
         self._integer = False
         self._syncing_handles = False
         self._hist_max = 1.0          # max bar height; the mapping ramp is scaled to it
+        # Extra (intensity, mapped) knots between the window ends, installed by
+        # Auto Contrast. Empty means the plain linear window ramp.
+        self._interior = []
         self.init_ui()
         # Full-range window by default so both dots sit at their proper corners
         # (low at the left baseline, high at the far right) before any data loads.
@@ -1323,7 +1483,30 @@ class BrightnessCurveWidget(QWidget):
 
         self.auto_minmax_btn = QCheckBox('Auto Min Max')
         self.auto_minmax_btn.toggled.connect(self._on_auto_minmax_toggled)
+
+        self.auto_contrast_btn = QPushButton('Auto Contrast')
+        self.auto_contrast_btn.setToolTip(
+            f'Split the histogram into {AUTO_CONTRAST_K} clusters of minimal variance\n'
+            f'and give each one an equal slice of the greyscale.\n'
+            'Moving the window returns to a plain linear ramp.')
+        self.auto_contrast_btn.clicked.connect(self.auto_contrast_requested.emit)
+
+        self.reset_curve_btn = QPushButton('Reset')
+        self.reset_curve_btn.setToolTip(
+            'Restore the plain linear ramp.\nThe window itself is left alone.')
+        self.reset_curve_btn.clicked.connect(lambda: self.set_interior_knots(None))
+        # Nothing to reset until Auto Contrast has actually changed the curve.
+        self.reset_curve_btn.setEnabled(False)
+
+        # Auto Min Max gets its own row: beside Auto Contrast it would need
+        # ~220 px and force the whole sidebar wider than the 200 px it's
+        # designed around. Auto Contrast + Reset fit on one row together.
         layout.addWidget(self.auto_minmax_btn)
+        curve_row = QHBoxLayout()
+        curve_row.setContentsMargins(0, 0, 0, 0)
+        curve_row.addWidget(self.auto_contrast_btn, 1)
+        curve_row.addWidget(self.reset_curve_btn)
+        layout.addLayout(curve_row)
 
     def _on_auto_minmax_toggled(self, enabled):
         self.range_slider.setEnabled(not enabled)
@@ -1360,8 +1543,10 @@ class BrightnessCurveWidget(QWidget):
         prev = self._syncing_handles
         self._syncing_handles = True
         try:
+            # points[1] / points[-2] are the window ends; Auto Contrast knots
+            # sit between them, so index from both ends rather than 1 and 2.
             self.low_handle.setPos(self.points[1][0], self.points[1][1] * H)
-            self.high_handle.setPos(self.points[2][0], self.points[2][1] * H)
+            self.high_handle.setPos(self.points[-2][0], self.points[-2][1] * H)
         finally:
             self._syncing_handles = prev
 
@@ -1423,16 +1608,18 @@ class BrightnessCurveWidget(QWidget):
         self.update_plot()
 
     def _bar_styles(self, centers):
-        """Per-bar grayscale brushes + matching pens for the window mapping:
-        black below window-min, white above window-max, gray ramp between.
+        """Per-bar grayscale brushes + matching pens showing the current mapping:
+        black below window-min, white above window-max, and in between whatever
+        the curve says — a plain ramp normally, a stepped one after Auto
+        Contrast, so the bars preview exactly what the slices will look like.
 
         The pen matches the brush so each thin bar is a solid block of its
         gray value (no contrasting outline diluting the colour).
         """
-        lo, hi = self.window_min(), self.window_max()
-        lo, hi = min(lo, hi), max(lo, hi)
-        levels = np.clip((centers - lo) / max(hi - lo, 1e-9), 0.0, 1.0)
-        levels = (levels * 255).astype(int)
+        xs, ys = _curve_xy(self.points)
+        levels = np.interp(np.asarray(centers, dtype=np.float64), xs, ys,
+                           left=0.0, right=1.0)
+        levels = np.clip(levels * 255.0, 0, 255).astype(int)
         colors = [QtGui.QColor(int(v), int(v), int(v)) for v in levels]
         return [pg.mkBrush(c) for c in colors], [pg.mkPen(c) for c in colors]
 
@@ -1485,12 +1672,35 @@ class BrightnessCurveWidget(QWidget):
         self.label_max_val.setText(self._fmt(self.window_max()))
 
     def on_slider_changed(self):
+        # A new window invalidates the clustering the knots were derived from,
+        # so fall back to the plain linear ramp rather than stretching stale
+        # cluster boundaries over a range they were never computed for.
+        if self._interior:
+            self.set_interior_knots(None)
+            return
+        self._rebuild_points()
+
+    def set_interior_knots(self, knots):
+        """Install Auto Contrast's mapping knots (or None to go back to linear)."""
+        self._interior = list(knots or [])
+        _set_button_active(self.auto_contrast_btn, bool(self._interior))
+        self.reset_curve_btn.setEnabled(bool(self._interior))
+        self._rebuild_points()
+
+    def interior_knots(self):
+        return list(self._interior)
+
+    def _rebuild_points(self):
         low = self.window_min()
         high = self.window_max()
         low, high = min(low, high), max(low, high)
+        # Knots outside the window would break the curve's monotonic x order.
+        interior = [(float(x), float(y)) for x, y in self._interior
+                    if low < x < high]
         self.points = [
             (self._data_min, 0.0),
             (low, 0.0),
+            *interior,
             (high, 1.0),
             (self._data_max, 1.0),
         ]
@@ -2447,6 +2657,7 @@ class SliceViewer(QWidget):
         self._surf_outline_item = None # pg.PlotDataItem of the slice ∩ surface
         self._clip_state = 'off'
         self._display_levels = None
+        self._display_lut = None      # Auto Contrast greyscale LUT, or None for linear
         self._auto_range_pending = True
         self._preview_R      = None   # 3×3 rotation for live Simple Alignment preview
         self._preview_offset = None   # (3,) offset
@@ -2727,6 +2938,21 @@ class SliceViewer(QWidget):
                 self.image_view.getImageItem().setLevels((float(min_val), float(max_val)))
             except Exception:
                 pass
+
+    def set_curve(self, points):
+        """Apply the histogram panel's mapping curve to the displayed slice.
+
+        The curve rides on top of the window as a greyscale lookup table, which
+        pyqtgraph applies at render time — so this stays a real-time update, and
+        the LUT survives later ``setImage`` calls without re-applying.
+        """
+        lo, hi = self._display_levels if self._display_levels else (0.0, 1.0)
+        self._display_lut = None if _curve_is_linear(points) else \
+            _curve_lut(points, lo, hi)
+        try:
+            self.image_view.getImageItem().setLookupTable(self._display_lut)
+        except Exception:
+            pass
 
     def set_interpolation(self, enabled):
         """Smoothly interpolate the displayed slice (bilinear in-plane) instead
@@ -3086,6 +3312,11 @@ class SliceViewer(QWidget):
         self.clear_record_lines()
         self.volume_data = volume_data
         self._display_levels = None
+        self._display_lut = None
+        try:
+            self.image_view.getImageItem().setLookupTable(None)
+        except Exception:
+            pass
         self._auto_range_pending = True
         self._perm_R = None
         self._perm_offset = None
@@ -3932,6 +4163,7 @@ class VolumeRender3D(QWidget):
         self._render_vol_min = 0.0
         self._render_vol_max = 1.0
         self._display_levels = None   # (lo, hi) window from the histogram, or None
+        self._display_curve = None    # Auto Contrast mapping knots, or None for linear
         self._perm_volume = None      # permanent aligned display volume (non-destructive)
         self._quality = 'Default'     # 'Low' 256³, 'Default' 512³ (2×), 'High' 1024³ (4×)
         self._clips = {}              # axis(0/1/2) -> ('left'|'right', fraction)
@@ -4811,6 +5043,11 @@ class VolumeRender3D(QWidget):
         """Set the histogram window applied to the rendered volume."""
         self._display_levels = (float(min_val), float(max_val))
 
+    def set_curve(self, points):
+        """Set the mapping curve applied inside the window (None = linear)."""
+        self._display_curve = None if _curve_is_linear(points) else \
+            tuple((float(x), float(y)) for x, y in points)
+
     def set_permanent_volume(self, vol):
         """Show a pre-aligned display volume without overwriting the data volume."""
         self._perm_volume = vol
@@ -5163,6 +5400,19 @@ class VolumeRender3D(QWidget):
             hi = lo + 1e-6
         normalized = np.clip((volume - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
 
+        # Reshape the ramp inside the window to match Auto Contrast, so the 3D
+        # render and the 2D slices show the same material boundaries. Done in
+        # slabs because np.interp always returns float64 — on a billion-voxel
+        # volume a single call would allocate 8 GB.
+        if self._display_curve is not None:
+            xs, ys = _curve_xy(self._display_curve)
+            xs = (np.clip(xs, lo, hi) - lo) / (hi - lo)   # curve → normalized space
+            plane = max(1, normalized[0].size)
+            step = max(1, int(64_000_000 / (plane * 8)))  # ≈64 MB of float64 per slab
+            for s in range(0, normalized.shape[0], step):
+                normalized[s:s + step] = np.interp(
+                    normalized[s:s + step], xs, ys, left=0.0, right=1.0)
+
         # Surface normals via volume gradient for Phong-style shading. Compute
         # one axis at a time, casting to float32, to limit peak RAM.
         gx = np.gradient(normalized, axis=0).astype(np.float32)
@@ -5196,7 +5446,7 @@ class VolumeRender3D(QWidget):
                 return
             # Build the full-volume RGBA once per (volume, window); clipping then
             # just hides voxels by zeroing their alpha (data is untouched).
-            key = (id(volume), self._display_levels)
+            key = (id(volume), self._display_levels, self._display_curve)
             if self._rgba_cache_key != key or self._rgba_base is None:
                 self._rgba_base = self._build_rgba(volume)
                 self._rgba_cache_key = key
@@ -6361,6 +6611,7 @@ class MainWindow(QMainWindow):
         self.left_panel.setMinimumWidth(200)
         self.left_panel.setMaximumWidth(420)
         self.left_panel.curve_changed.connect(self.on_curve_changed)
+        self.left_panel.auto_contrast_requested.connect(self.on_auto_contrast)
 
         # Project Structure tree above the histogram, sharing the sidebar 50/50.
         self.project_tree = ProjectStructureWidget(self)
@@ -6640,6 +6891,7 @@ class MainWindow(QMainWindow):
         pip.mode           = src.mode
         pip._quality       = src._quality
         pip._display_levels = src._display_levels
+        pip._display_curve  = src._display_curve
         pip.iso_threshold_percent = src.iso_threshold_percent
         # Mirror the Surface Mesh renderer too (otherwise the PiP falls back to
         # Phong). _render_surface places the mesh relative to the render frame, so
@@ -6990,6 +7242,8 @@ class MainWindow(QMainWindow):
                 'window_min': panel.window_min(),
                 'window_max': panel.window_max(),
                 'scale': self.preferences.get('histogram_scale', 'Logarithmic'),
+                'auto_contrast_knots': [[float(x), float(y)]
+                                        for x, y in panel.interior_knots()],
             },
             'alignment': align,
             'alignments': [self._serialize_alignment(a) for a in self._alignments],
@@ -7103,6 +7357,11 @@ class MainWindow(QMainWindow):
         win_max = hist.get('window_max')
         if win_min is not None and win_max is not None:
             self.left_panel.set_window_minmax(win_min, win_max)
+        # Restore after the window: setting the window resets to a linear ramp.
+        knots = hist.get('auto_contrast_knots')
+        if knots:
+            self.left_panel.set_interior_knots([(float(x), float(y))
+                                                for x, y in knots])
         scale = hist.get('scale')
         if scale:
             self.preferences['histogram_scale'] = scale
@@ -7417,15 +7676,49 @@ class MainWindow(QMainWindow):
         self._sync_measurements()
         self._sync_gray()
 
+    def on_auto_contrast(self):
+        """Cluster the histogram and give each cluster an equal slice of grey.
+
+        Clustering runs over the *current window* rather than the whole data
+        range: values outside the window already clamp to black or white, so
+        spending clusters on them would waste them. With the default full-range
+        window that's simply the whole histogram.
+        """
+        if not self.volume_data.is_loaded():
+            return
+        counts = getattr(self.volume_data, 'fine_histogram', None)
+        edges = getattr(self.volume_data, 'fine_bin_edges', None)
+        if counts is None or edges is None:
+            QMessageBox.warning(self, 'Auto Contrast',
+                                'The volume has no histogram to cluster.')
+            return
+        centers = (edges[:-1] + edges[1:]) / 2.0
+        lo, hi = self.left_panel.window_min(), self.left_panel.window_max()
+        lo, hi = min(lo, hi), max(lo, hi)
+        inside = (centers >= lo) & (centers <= hi)
+        knots = None
+        if inside.any():
+            knots = _auto_contrast_knots(centers[inside],
+                                         np.asarray(counts)[inside])
+        if not knots:
+            QMessageBox.warning(
+                self, 'Auto Contrast',
+                f'The window holds too few distinct intensities to split into '
+                f'{AUTO_CONTRAST_K} clusters.')
+            return
+        self.left_panel.set_interior_knots(knots)
+
     def on_curve_changed(self, curve):
         if not self.volume_data.is_loaded() or len(curve) < 4:
             return
         min_val = curve[1][0]
-        max_val = curve[2][0]
+        max_val = curve[-2][0]
         self._mark_dirty()
         for viewer in (self.view_xy, self.view_yz, self.view_xz):
             viewer.set_levels(min_val, max_val)   # fast LUT update, no re-slice
+            viewer.set_curve(curve)
         self.view_3d.set_levels(min_val, max_val)
+        self.view_3d.set_curve(curve)
         # Only the Phong volume render depends on the window. The isosurface and
         # a created Surface Mesh both ignore it entirely, so re-rendering them on
         # a window change is pure wasted work — and rebuilding a large surface
